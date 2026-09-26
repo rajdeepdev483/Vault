@@ -1071,10 +1071,20 @@ const ready = runMigrations()
     // catch already turns that into a clean 500 response.
     if (require.main === module) {
       process.exit(1);
-    } else {
-      throw err;
     }
+    throw err;
   });
+
+// `ready` may stay rejected for a moment before anything actually reads
+// it — api/index.js only does `await ready` once the first HTTP request
+// comes in, which can be a tick or more after this module first loads
+// at cold start. Node treats a promise rejection with zero attached
+// handlers, once the microtask queue drains, as fatal and kills the
+// whole process — exactly the crash this was meant to avoid. Attaching
+// a silent handler here marks `ready` as "handled" for that check,
+// without affecting the real rejection that api/index.js awaits below
+// (a promise can have more than one .then()/.catch() attached to it).
+ready.catch(() => {});
 
 function shutdown() {
   console.log('Shutting down safely...');

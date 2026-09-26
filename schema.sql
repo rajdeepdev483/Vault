@@ -13,7 +13,9 @@
 -- =====================================================================
 
 PRAGMA foreign_keys = ON;      -- enforce links between tables
-PRAGMA journal_mode = WAL;     -- crash-safe writes, no half-saved data
+-- (No `PRAGMA journal_mode = WAL;` here: Turso's remote server manages
+--  its own journal mode and rejects that pragma over the network with
+--  SQL_PARSE_ERROR — it already runs in WAL-equivalent mode itself.)
 
 -- ---------------------------------------------------------------------
 -- 1. USERS  (login system; your father is the main/admin user)
