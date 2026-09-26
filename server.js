@@ -1101,4 +1101,13 @@ function shutdown() {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-module.exports = { app, ready };
+// Export the Express `app` itself as the default export — it's callable
+// (Express apps are just `function(req, res)` under the hood), so this
+// is valid whether Vercel invokes it via api/index.js's own
+// `require('../server.js')` destructuring below, OR ends up treating
+// this file as a serverless function/entry point in its own right
+// (which needs a function or server as the default export, not a plain
+// object). `ready` rides along as a property on the same export so
+// api/index.js can still get both.
+app.ready = ready;
+module.exports = app;

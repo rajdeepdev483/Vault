@@ -24,7 +24,8 @@
 // =====================================================================
 'use strict';
 
-const { app, ready } = require('../server.js');
+const app = require('../server.js');
+const { ready } = app;
 
 module.exports = async (req, res) => {
   try {
