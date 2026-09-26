@@ -1065,7 +1065,18 @@ const ready = runMigrations()
   })
   .catch((err) => {
     console.error('[Vault] Failed to start (migrations):', err);
-    process.exit(1);
+    // Only kill the whole process for a traditional `node server.js`
+    // host, where there's no other way to signal a fatal boot failure.
+    // On Vercel (require.main !== module here — this file was required
+    // by api/index.js) process.exit(1) would take the entire serverless
+    // instance down before it ever gets to respond, so instead let this
+    // rejection propagate: `ready` rejects, and api/index.js's own
+    // catch already turns that into a clean 500 response.
+    if (require.main === module) {
+      process.exit(1);
+    } else {
+      throw err;
+    }
   });
 
 function shutdown() {
