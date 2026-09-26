@@ -171,7 +171,7 @@ function validPassword(p) {
 // ---------------------------------------------------------------------
 const OTP_TTL_MINUTES = 10;
 const OTP_MAX_ATTEMPTS = 5;
-const OTP_MAX_PER_HOUR = 5;
+const OTP_MAX_PER_HOUR = 10;
 const OTP_RESEND_COOLDOWN_SECONDS = 45;
 const VERIFY_TOKEN_TTL_MINUTES = 15;
 
