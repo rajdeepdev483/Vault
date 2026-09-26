@@ -1025,9 +1025,6 @@ if (IS_PROD) {
   if (!SETUP_CODE) {
     console.warn('[Vault] WARNING: SETUP_CODE is not set. Set it before going live so a stranger cannot create the first account before you do.');
   }
-  if ((process.env.SMS_PROVIDER || 'console').toLowerCase() === 'console') {
-    console.warn('[Vault] WARNING: No SMS_PROVIDER is set — OTP codes print to this log instead of being texted. Set SMS_PROVIDER (fast2sms, whatsapp, or webhook) before going live.');
-  }
   if (!process.env.BACKUP_WEBHOOK_URL) {
     console.warn('[Vault] NOTE: No off-site backup is configured (BACKUP_WEBHOOK_URL). On Vercel, prefer Turso\'s own backups — see DEPLOYMENT.md.');
   }
