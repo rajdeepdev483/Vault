@@ -15,9 +15,10 @@
 
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
 const express = require('express');
-const Database = require('better-sqlite3');
+const { makeDb } = require('./lib/db');
 const bcrypt = require('bcryptjs');
 const cookieParser = require('cookie-parser');
 const helmet = require('helmet');
@@ -28,8 +29,10 @@ const rateLimit = require('express-rate-limit');
 // ---------------------------------------------------------------------
 const PORT = Number(process.env.PORT) || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'vault.db');
+// On Vercel (and most serverless hosts) only /tmp is writable, and it does
+// not persist between requests — it's just scratch space for building a
+// backup file to stream down before the function exits.
+const DATA_DIR = process.env.DATA_DIR || (IS_PROD ? os.tmpdir() : path.join(__dirname, 'data'));
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 const SESSION_COOKIE = 'vault_sid';
 const SESSION_DAYS = 30;
@@ -39,16 +42,24 @@ const BCRYPT_ROUNDS = 12;
 const SETUP_CODE = process.env.SETUP_CODE || '';
 
 // ---------------------------------------------------------------------
-// DATABASE
+// DATABASE (Turso / libsql — set these in your Vercel project's
+// Environment Variables, never commit them to the repo)
+//   TURSO_DATABASE_URL  e.g. libsql://vault-xxxx.aws-ap-northeast-1.turso.io
+//   TURSO_AUTH_TOKEN    the token from `turso db tokens create vault`
 // ---------------------------------------------------------------------
-fs.mkdirSync(DATA_DIR, { recursive: true });
-const db = new Database(DB_FILE);
-db.pragma('journal_mode = WAL');    // crash-safe writing
-db.pragma('synchronous = FULL');    // safest setting: data hits the disk before "saved"
-db.pragma('foreign_keys = ON');
+if (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN) {
+  console.error('[Vault] Missing TURSO_DATABASE_URL / TURSO_AUTH_TOKEN environment variables.');
+  process.exit(1);
+}
+const db = makeDb({
+  url: process.env.TURSO_DATABASE_URL,
+  authToken: process.env.TURSO_AUTH_TOKEN,
+});
+db.pragma('foreign_keys = ON'); // no-op placeholder, Turso enforces this already
 
-// Create all tables from Step 1 (safe to run every time; existing data is untouched)
-db.exec(fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8'));
+// Create all tables from Step 1 (safe to run every time; existing data is untouched).
+// Everything from here down that touches the database needs to happen after
+// this finishes, so the rest of startup is wrapped in start().
 
 // ---------------------------------------------------------------------
 // MIGRATION: email-linked accounts + OTP codes
@@ -58,76 +69,86 @@ db.exec(fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8'));
 // soft-disabled (is_active = 0), never removed from the table, so a
 // user's id and record are permanent.
 // ---------------------------------------------------------------------
-function ensureColumn(table, column, ddl) {
-  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
-  if (!cols.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+async function ensureColumn(table, column, ddl) {
+  const cols = (await db.prepare(`PRAGMA table_info(${table})`).all()).map((c) => c.name);
+  if (!cols.includes(column)) await db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
 }
-// Legacy phone column (kept, untouched, for any pre-existing installs —
-// never dropped, since we never delete data). Email is now the
-// identity/verification channel used everywhere going forward.
-ensureColumn('users', 'phone', 'phone TEXT');
-ensureColumn('users', 'phone_verified_at', 'phone_verified_at TEXT');
-ensureColumn('users', 'email', 'email TEXT');
-ensureColumn('users', 'email_verified_at', 'email_verified_at TEXT');
-ensureColumn('users', 'failed_attempts', 'failed_attempts INTEGER NOT NULL DEFAULT 0');
-ensureColumn('users', 'locked_until', 'locked_until TEXT');
-db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone ON users(phone) WHERE phone IS NOT NULL;`);
-db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL;`);
 
-// ---------------------------------------------------------------------
-// MIGRATION: multi-account data isolation
-// Every borrower (and everything under it — loans, transactions) and
-// every reminder now belongs to the account that created it, so one
-// signed-up user can never see another user's records. Existing data
-// (from before this feature existed) is handed to the very first
-// account, so nothing already in the ledger becomes orphaned or newly
-// visible to anyone else.
-// ---------------------------------------------------------------------
-ensureColumn('borrowers', 'owner_id', 'owner_id INTEGER REFERENCES users(id)');
-ensureColumn('reminders', 'owner_id', 'owner_id INTEGER REFERENCES users(id)');
-db.exec(`UPDATE borrowers SET owner_id = (SELECT MIN(id) FROM users) WHERE owner_id IS NULL AND (SELECT MIN(id) FROM users) IS NOT NULL;`);
-db.exec(`UPDATE reminders SET owner_id = (SELECT MIN(id) FROM users) WHERE owner_id IS NULL AND (SELECT MIN(id) FROM users) IS NOT NULL;`);
-db.exec(`CREATE INDEX IF NOT EXISTS idx_borrowers_owner ON borrowers(owner_id);`);
-db.exec(`CREATE INDEX IF NOT EXISTS idx_reminders_owner ON reminders(owner_id);`);
-// otp_codes holds only short-lived (10-minute) verification codes, never
-// account or ledger data, so recreating it fresh when upgrading from the
-// old phone-based shape (no "email" column yet) is safe and loses nothing
-// that matters — any in-flight code just needs to be requested again.
-{
-  const otpCols = db.prepare("PRAGMA table_info(otp_codes)").all().map((c) => c.name);
-  if (otpCols.length && !otpCols.includes('email')) {
-    db.exec('DROP TABLE IF EXISTS otp_codes;');
+// Runs the schema + every migration, in order, once, before the server
+// starts accepting requests. Safe to run every time the process boots.
+async function runMigrations() {
+  await db.exec(fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8'));
+
+  // Legacy phone column (kept, untouched, for any pre-existing installs —
+  // never dropped, since we never delete data). Email is now the
+  // identity/verification channel used everywhere going forward.
+  await ensureColumn('users', 'phone', 'phone TEXT');
+  await ensureColumn('users', 'phone_verified_at', 'phone_verified_at TEXT');
+  await ensureColumn('users', 'email', 'email TEXT');
+  await ensureColumn('users', 'email_verified_at', 'email_verified_at TEXT');
+  await ensureColumn('users', 'failed_attempts', 'failed_attempts INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn('users', 'locked_until', 'locked_until TEXT');
+  await db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone ON users(phone) WHERE phone IS NOT NULL;`);
+  await db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL;`);
+
+  // MIGRATION: multi-account data isolation — every borrower (and
+  // everything under it — loans, transactions) and every reminder now
+  // belongs to the account that created it, so one signed-up user can
+  // never see another user's records. Existing data (from before this
+  // feature existed) is handed to the very first account, so nothing
+  // already in the ledger becomes orphaned or newly visible to anyone else.
+  await ensureColumn('borrowers', 'owner_id', 'owner_id INTEGER REFERENCES users(id)');
+  await ensureColumn('reminders', 'owner_id', 'owner_id INTEGER REFERENCES users(id)');
+  await db.exec(`UPDATE borrowers SET owner_id = (SELECT MIN(id) FROM users) WHERE owner_id IS NULL AND (SELECT MIN(id) FROM users) IS NOT NULL;`);
+  await db.exec(`UPDATE reminders SET owner_id = (SELECT MIN(id) FROM users) WHERE owner_id IS NULL AND (SELECT MIN(id) FROM users) IS NOT NULL;`);
+  await db.exec(`CREATE INDEX IF NOT EXISTS idx_borrowers_owner ON borrowers(owner_id);`);
+  await db.exec(`CREATE INDEX IF NOT EXISTS idx_reminders_owner ON reminders(owner_id);`);
+
+  // otp_codes holds only short-lived (10-minute) verification codes, never
+  // account or ledger data, so recreating it fresh when upgrading from the
+  // old phone-based shape (no "email" column yet) is safe and loses nothing
+  // that matters — any in-flight code just needs to be requested again.
+  {
+    const otpCols = (await db.prepare("PRAGMA table_info(otp_codes)").all()).map((c) => c.name);
+    if (otpCols.length && !otpCols.includes('email')) {
+      await db.exec('DROP TABLE IF EXISTS otp_codes;');
+    }
   }
-}
-db.exec(`
-  CREATE TABLE IF NOT EXISTS otp_codes (
-      id                       INTEGER PRIMARY KEY AUTOINCREMENT,
-      email                    TEXT    NOT NULL,
-      purpose                  TEXT    NOT NULL CHECK (purpose IN ('signup','reset','login')),
-      code_hash                TEXT    NOT NULL,
-      attempts                 INTEGER NOT NULL DEFAULT 0,
-      verify_token_hash        TEXT,
-      verify_token_expires_at  TEXT,
-      consumed_at              TEXT,
-      expires_at               TEXT    NOT NULL,
-      created_at               TEXT    NOT NULL DEFAULT (datetime('now'))
-  );
-  CREATE INDEX IF NOT EXISTS idx_otp_email_purpose ON otp_codes(email, purpose);
-`);
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS otp_codes (
+        id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+        email                    TEXT    NOT NULL,
+        purpose                  TEXT    NOT NULL CHECK (purpose IN ('signup','reset','login')),
+        code_hash                TEXT    NOT NULL,
+        attempts                 INTEGER NOT NULL DEFAULT 0,
+        verify_token_hash        TEXT,
+        verify_token_expires_at  TEXT,
+        consumed_at              TEXT,
+        expires_at               TEXT    NOT NULL,
+        created_at               TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_otp_email_purpose ON otp_codes(email, purpose);
+  `);
 
-// Login sessions live in the database so restarts don't log people out
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sessions (
-      token_hash  TEXT PRIMARY KEY,
-      user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-      expires_at  TEXT NOT NULL,
-      user_agent  TEXT,
-      ip_address  TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
-`);
-ensureColumn('sessions', 'ip_address', 'ip_address TEXT');
+  // Login sessions live in the database so restarts don't log people out
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+        token_hash  TEXT PRIMARY KEY,
+        user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at  TEXT NOT NULL,
+        user_agent  TEXT,
+        ip_address  TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+  `);
+  await ensureColumn('sessions', 'ip_address', 'ip_address TEXT');
+
+  // A setting that controls the "upcoming" list on the home page
+  // (moved here from routes/dashboard.js so it runs after schema creation,
+  // instead of racing it at route-registration time)
+  await db.exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('upcoming_days', '7')");
+}
 
 // ---------------------------------------------------------------------
 // HELPERS
@@ -250,13 +271,13 @@ async function sendOtpEmail(email, code, purpose) {
 // per-address rate limits regardless of which flow (signup, reset, or
 // login) is asking for it, then sends it. Throws HttpError on rate limit.
 async function issueOtp(email, purpose) {
-  const recentCount = db
+  const recentRow = await db
     .prepare(`SELECT COUNT(*) AS c FROM otp_codes WHERE email = ? AND purpose = ? AND created_at > datetime('now', '-1 hour')`)
-    .get(email, purpose).c;
-  if (recentCount >= OTP_MAX_PER_HOUR) {
+    .get(email, purpose);
+  if (recentRow.c >= OTP_MAX_PER_HOUR) {
     throw new HttpError(429, 'Too many codes requested for this email. Please wait a while and try again.');
   }
-  const last = db
+  const last = await db
     .prepare(`SELECT created_at FROM otp_codes WHERE email = ? AND purpose = ? ORDER BY id DESC LIMIT 1`)
     .get(email, purpose);
   if (last) {
@@ -266,7 +287,7 @@ async function issueOtp(email, purpose) {
     }
   }
   const code = generateOtp();
-  db.prepare(`INSERT INTO otp_codes (email, purpose, code_hash, expires_at) VALUES (?, ?, ?, datetime('now', ?))`).run(
+  await db.prepare(`INSERT INTO otp_codes (email, purpose, code_hash, expires_at) VALUES (?, ?, ?, datetime('now', ?))`).run(
     email, purpose, sha256(code), `+${OTP_TTL_MINUTES} minutes`
   );
   await sendOtpEmail(email, code, purpose);
@@ -313,9 +334,9 @@ function publicUser(u) {
   return { id: u.id, username: u.username, fullName: u.full_name, role: u.role };
 }
 
-function startSession(req, res, userId) {
+async function startSession(req, res, userId) {
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare(
+  await db.prepare(
     `INSERT INTO sessions (token_hash, user_id, expires_at, user_agent, ip_address)
      VALUES (?, ?, datetime('now', ?), ?, ?)`
   ).run(
@@ -356,8 +377,8 @@ class HttpError extends Error {
 }
 
 // Permanent history of every change (see audit_log in schema.sql)
-function audit(userId, table, recordId, action, oldData, newData) {
-  db.prepare(
+async function audit(userId, table, recordId, action, oldData, newData) {
+  await db.prepare(
     `INSERT INTO audit_log (user_id, table_name, record_id, action, old_data, new_data)
      VALUES (?, ?, ?, ?, ?, ?)`
   ).run(
@@ -445,25 +466,29 @@ app.use('/api', (req, res, next) => {
 });
 
 // Who is logged in? (runs on every request)
-app.use((req, res, next) => {
+app.use(async (req, res, next) => {
   req.user = null;
   req.sessionHash = null;
-  const token = req.cookies && req.cookies[SESSION_COOKIE];
-  if (token) {
-    const hash = sha256(token);
-    const row = db
-      .prepare(
-        `SELECT u.id, u.username, u.full_name, u.role
-           FROM sessions s JOIN users u ON u.id = s.user_id
-          WHERE s.token_hash = ? AND s.expires_at > datetime('now') AND u.is_active = 1`
-      )
-      .get(hash);
-    if (row) {
-      req.user = row;
-      req.sessionHash = hash;
+  try {
+    const token = req.cookies && req.cookies[SESSION_COOKIE];
+    if (token) {
+      const hash = sha256(token);
+      const row = await db
+        .prepare(
+          `SELECT u.id, u.username, u.full_name, u.role
+             FROM sessions s JOIN users u ON u.id = s.user_id
+            WHERE s.token_hash = ? AND s.expires_at > datetime('now') AND u.is_active = 1`
+        )
+        .get(hash);
+      if (row) {
+        req.user = row;
+        req.sessionHash = hash;
+      }
     }
+    next();
+  } catch (err) {
+    next(err);
   }
-  next();
 });
 
 // Use this on any route that needs a logged-in user
@@ -498,8 +523,8 @@ const otpLimiter = rateLimit({
 app.get('/api/health', (req, res) => res.json({ ok: true, app: 'Vault' }));
 
 // The front end calls this first to decide: show setup, login, or the app
-app.get('/api/auth/status', (req, res) => {
-  const setupRequired = db.prepare('SELECT COUNT(*) AS c FROM users').get().c === 0;
+app.get('/api/auth/status', async (req, res) => {
+  const setupRequired = (await db.prepare('SELECT COUNT(*) AS c FROM users').get()).c === 0;
   res.json({
     setupRequired,
     setupCodeRequired: setupRequired && !!SETUP_CODE,
@@ -530,14 +555,14 @@ app.post('/api/auth/otp/request', otpLimiter, async (req, res) => {
 
   // Anyone can sign up, any time — but one email address can only ever
   // back one account, so an already-registered address can't sign up again.
-  if (purpose === 'signup' && db.prepare('SELECT 1 FROM users WHERE email = ? AND is_active = 1').get(email)) {
+  if (purpose === 'signup' && await db.prepare('SELECT 1 FROM users WHERE email = ? AND is_active = 1').get(email)) {
     return res.status(403).json({ error: 'An account with this email address already exists. Try logging in instead.' });
   }
 
   // For a password reset, only actually send a code if that address is
   // registered — but always answer the same way either way, so the form
   // can't be used to check which addresses have accounts.
-  if (purpose === 'reset' && !db.prepare('SELECT 1 FROM users WHERE email = ? AND is_active = 1').get(email)) {
+  if (purpose === 'reset' && !(await db.prepare('SELECT 1 FROM users WHERE email = ? AND is_active = 1').get(email))) {
     return res.json({ ok: true, expiresInSeconds: OTP_TTL_MINUTES * 60 });
   }
 
@@ -552,7 +577,7 @@ app.post('/api/auth/otp/request', otpLimiter, async (req, res) => {
   res.json({ ok: true, expiresInSeconds: OTP_TTL_MINUTES * 60 });
 });
 
-app.post('/api/auth/otp/verify', otpLimiter, (req, res) => {
+app.post('/api/auth/otp/verify', otpLimiter, async (req, res) => {
   const body = req.body || {};
   const purpose = body.purpose;
   if (!['signup', 'reset', 'login'].includes(purpose)) {
@@ -563,7 +588,7 @@ app.post('/api/auth/otp/verify', otpLimiter, (req, res) => {
   const code = typeof body.code === 'string' ? body.code.trim() : '';
   if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Enter the 6-digit code.' });
 
-  const row = db
+  const row = await db
     .prepare(
       `SELECT * FROM otp_codes WHERE email = ? AND purpose = ? AND consumed_at IS NULL AND expires_at > datetime('now')
        ORDER BY id DESC LIMIT 1`
@@ -574,12 +599,12 @@ app.post('/api/auth/otp/verify', otpLimiter, (req, res) => {
     return res.status(429).json({ error: 'Too many incorrect attempts. Please request a new code.' });
   }
   if (sha256(code) !== row.code_hash) {
-    db.prepare('UPDATE otp_codes SET attempts = attempts + 1 WHERE id = ?').run(row.id);
+    await db.prepare('UPDATE otp_codes SET attempts = attempts + 1 WHERE id = ?').run(row.id);
     return res.status(400).json({ error: 'Incorrect code. Please try again.' });
   }
 
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare(`UPDATE otp_codes SET verify_token_hash = ?, verify_token_expires_at = datetime('now', ?) WHERE id = ?`).run(
+  await db.prepare(`UPDATE otp_codes SET verify_token_hash = ?, verify_token_expires_at = datetime('now', ?) WHERE id = ?`).run(
     sha256(token), `+${VERIFY_TOKEN_TTL_MINUTES} minutes`, row.id
   );
 
@@ -591,10 +616,10 @@ app.post('/api/auth/otp/verify', otpLimiter, (req, res) => {
 // first account on a fresh site is gated by an optional setup code; every
 // account after that is a normal public sign-up. Each account's borrowers,
 // loans and reminders are private to it (see the owner_id migration above).
-app.post('/api/auth/setup', authLimiter, (req, res) => {
+app.post('/api/auth/setup', authLimiter, async (req, res) => {
   const { fullName, username, password, setupCode, verificationToken } = req.body || {};
 
-  const isFirstAccount = db.prepare('SELECT COUNT(*) AS c FROM users').get().c === 0;
+  const isFirstAccount = (await db.prepare('SELECT COUNT(*) AS c FROM users').get()).c === 0;
   if (isFirstAccount && !setupCodeMatches(setupCode)) {
     return res.status(403).json({ error: 'Incorrect setup code.' });
   }
@@ -614,7 +639,7 @@ app.post('/api/auth/setup', authLimiter, (req, res) => {
     return res.status(400).json({ error: 'Password must be at least 8 characters (max 72).' });
   }
 
-  const otpRow = db
+  const otpRow = await db
     .prepare(
       `SELECT * FROM otp_codes WHERE email = ? AND purpose = 'signup' AND consumed_at IS NULL
          AND verify_token_hash = ? AND verify_token_expires_at > datetime('now')
@@ -628,18 +653,18 @@ app.post('/api/auth/setup', authLimiter, (req, res) => {
   // Every account created here keeps its row (and its id) forever — the
   // app only ever soft-disables an account (is_active = 0), it never runs
   // DELETE on the users table.
-  const userId = db.transaction(() => {
-    const info = db
+  const userId = await db.transaction(async () => {
+    const info = await db
       .prepare('INSERT INTO users (username, password_hash, full_name, role, email, email_verified_at) VALUES (?, ?, ?, ?, ?, datetime(\'now\'))')
       .run(username.trim().toLowerCase(), bcrypt.hashSync(password, BCRYPT_ROUNDS), fullName.trim(), 'admin', email);
-    db.prepare("UPDATE otp_codes SET consumed_at = datetime('now') WHERE id = ?").run(otpRow.id);
+    await db.prepare("UPDATE otp_codes SET consumed_at = datetime('now') WHERE id = ?").run(otpRow.id);
     return info.lastInsertRowid;
   })();
 
-  startSession(req, res, userId);
-  db.prepare("UPDATE users SET last_login_at = datetime('now') WHERE id = ?").run(userId);
+  await startSession(req, res, userId);
+  await db.prepare("UPDATE users SET last_login_at = datetime('now') WHERE id = ?").run(userId);
 
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
   res.status(201).json({ user: publicUser(user) });
 });
 
@@ -654,7 +679,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Please enter your username and password.' });
   }
 
-  const user = db
+  const user = await db
     .prepare('SELECT * FROM users WHERE username = ? AND is_active = 1')
     .get(username.trim().toLowerCase());
 
@@ -668,16 +693,16 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     if (user) {
       const attempts = (user.failed_attempts || 0) + 1;
       if (attempts >= MAX_FAILED_LOGIN_ATTEMPTS) {
-        db.prepare(`UPDATE users SET failed_attempts = 0, locked_until = datetime('now', ?) WHERE id = ?`)
+        await db.prepare(`UPDATE users SET failed_attempts = 0, locked_until = datetime('now', ?) WHERE id = ?`)
           .run(`+${LOCKOUT_MINUTES} minutes`, user.id);
       } else {
-        db.prepare('UPDATE users SET failed_attempts = ? WHERE id = ?').run(attempts, user.id);
+        await db.prepare('UPDATE users SET failed_attempts = ? WHERE id = ?').run(attempts, user.id);
       }
     }
     return res.status(401).json({ error: 'Incorrect username or password.' });
   }
 
-  db.prepare('UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?').run(user.id);
+  await db.prepare('UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?').run(user.id);
 
   if (!user.email) {
     // Account predates email-based accounts (e.g. an old phone-only
@@ -706,12 +731,12 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 // Step 2 of login: the 6-digit code from step 1, already verified via
 // POST /api/auth/otp/verify (purpose "login") into a verificationToken.
 // This is what actually starts the session.
-app.post('/api/auth/login/complete', authLimiter, (req, res) => {
+app.post('/api/auth/login/complete', authLimiter, async (req, res) => {
   const body = req.body || {};
   const email = normalizeEmail(body.email);
   if (!email) return res.status(400).json({ error: 'Enter a valid email address.' });
 
-  const otpRow = db
+  const otpRow = await db
     .prepare(
       `SELECT * FROM otp_codes WHERE email = ? AND purpose = 'login' AND consumed_at IS NULL
          AND verify_token_hash = ? AND verify_token_expires_at > datetime('now')
@@ -721,18 +746,18 @@ app.post('/api/auth/login/complete', authLimiter, (req, res) => {
   if (!otpRow) {
     return res.status(403).json({ error: 'Please verify the code again — it has expired.' });
   }
-  const user = db.prepare('SELECT * FROM users WHERE email = ? AND is_active = 1').get(email);
+  const user = await db.prepare('SELECT * FROM users WHERE email = ? AND is_active = 1').get(email);
   if (!user) return res.status(404).json({ error: 'No account found.' });
 
-  db.prepare("UPDATE otp_codes SET consumed_at = datetime('now') WHERE id = ?").run(otpRow.id);
-  startSession(req, res, user.id);
-  db.prepare("UPDATE users SET last_login_at = datetime('now') WHERE id = ?").run(user.id);
+  await db.prepare("UPDATE otp_codes SET consumed_at = datetime('now') WHERE id = ?").run(otpRow.id);
+  await startSession(req, res, user.id);
+  await db.prepare("UPDATE users SET last_login_at = datetime('now') WHERE id = ?").run(user.id);
   res.json({ user: publicUser(user) });
 });
 
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', async (req, res) => {
   if (req.sessionHash) {
-    db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(req.sessionHash);
+    await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(req.sessionHash);
   }
   res.clearCookie(SESSION_COOKIE, { path: '/' });
   res.json({ ok: true });
@@ -745,7 +770,7 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 // Update your own profile — full name and/or username. Changing the
 // username needs your current password (same as changing your password),
 // since the username is also your login ID.
-app.patch('/api/auth/me', requireAuth, authLimiter, (req, res) => {
+app.patch('/api/auth/me', requireAuth, authLimiter, async (req, res) => {
   const body = req.body || {};
   const wantsFullName = typeof body.fullName === 'string';
   const wantsUsername = typeof body.username === 'string';
@@ -753,7 +778,7 @@ app.patch('/api/auth/me', requireAuth, authLimiter, (req, res) => {
     return res.status(400).json({ error: 'Nothing to update.' });
   }
 
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
   const updates = {};
 
   if (wantsFullName) {
@@ -773,36 +798,36 @@ app.patch('/api/auth/me', requireAuth, authLimiter, (req, res) => {
       return res.status(401).json({ error: 'Enter your current password to change your username.' });
     }
     if (username !== user.username) {
-      const clash = db.prepare('SELECT 1 FROM users WHERE username = ? AND id != ?').get(username, user.id);
+      const clash = await db.prepare('SELECT 1 FROM users WHERE username = ? AND id != ?').get(username, user.id);
       if (clash) return res.status(409).json({ error: 'That username is already taken.' });
     }
     updates.username = username;
   }
 
   const sets = Object.keys(updates);
-  db.prepare(
+  await db.prepare(
     `UPDATE users SET ${sets.map((c) => `${c} = ?`).join(', ')}, updated_at = datetime('now') WHERE id = ?`
   ).run(...sets.map((c) => updates[c]), user.id);
 
-  const fresh = db.prepare('SELECT id, username, full_name, role FROM users WHERE id = ?').get(user.id);
+  const fresh = await db.prepare('SELECT id, username, full_name, role FROM users WHERE id = ?').get(user.id);
   res.json({ user: publicUser(fresh) });
 });
 
-app.post('/api/auth/change-password', requireAuth, authLimiter, (req, res) => {
+app.post('/api/auth/change-password', requireAuth, authLimiter, async (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
   if (typeof currentPassword !== 'string' || !validPassword(newPassword)) {
     return res.status(400).json({ error: 'New password must be at least 8 characters (max 72).' });
   }
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
   if (!bcrypt.compareSync(currentPassword, user.password_hash)) {
     return res.status(401).json({ error: 'Current password is incorrect.' });
   }
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(
+  await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(
     bcrypt.hashSync(newPassword, BCRYPT_ROUNDS),
     user.id
   );
   // Log out every other device; keep this one
-  db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(user.id, req.sessionHash);
+  await db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(user.id, req.sessionHash);
   res.json({ ok: true });
 });
 
@@ -813,8 +838,8 @@ app.post('/api/auth/change-password', requireAuth, authLimiter, (req, res) => {
 // session cookie, so exposing it as an id here can't be turned back
 // into a usable login token.
 // ---------------------------------------------------------------------
-app.get('/api/auth/sessions', requireAuth, (req, res) => {
-  const rows = db
+app.get('/api/auth/sessions', requireAuth, async (req, res) => {
+  const rows = await db
     .prepare(
       `SELECT token_hash, created_at, expires_at, user_agent, ip_address
          FROM sessions WHERE user_id = ? ORDER BY created_at DESC`
@@ -832,20 +857,20 @@ app.get('/api/auth/sessions', requireAuth, (req, res) => {
   });
 });
 
-app.delete('/api/auth/sessions/:id', requireAuth, (req, res) => {
-  db.prepare('DELETE FROM sessions WHERE token_hash = ? AND user_id = ?').run(req.params.id, req.user.id);
+app.delete('/api/auth/sessions/:id', requireAuth, async (req, res) => {
+  await db.prepare('DELETE FROM sessions WHERE token_hash = ? AND user_id = ?').run(req.params.id, req.user.id);
   if (req.params.id === req.sessionHash) res.clearCookie(SESSION_COOKIE, { path: '/' });
   res.json({ ok: true });
 });
 
-app.delete('/api/auth/sessions', requireAuth, (req, res) => {
-  db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(req.user.id, req.sessionHash);
+app.delete('/api/auth/sessions', requireAuth, async (req, res) => {
+  await db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(req.user.id, req.sessionHash);
   res.json({ ok: true });
 });
 
 // Forgotten password: email must have just been verified with a code via
 // /api/auth/otp/verify (purpose "reset") above.
-app.post('/api/auth/forgot-password/reset', authLimiter, (req, res) => {
+app.post('/api/auth/forgot-password/reset', authLimiter, async (req, res) => {
   const body = req.body || {};
   const email = normalizeEmail(body.email);
   if (!email) return res.status(400).json({ error: 'Enter a valid email address.' });
@@ -853,7 +878,7 @@ app.post('/api/auth/forgot-password/reset', authLimiter, (req, res) => {
     return res.status(400).json({ error: 'New password must be at least 8 characters (max 72).' });
   }
 
-  const otpRow = db
+  const otpRow = await db
     .prepare(
       `SELECT * FROM otp_codes WHERE email = ? AND purpose = 'reset' AND consumed_at IS NULL
          AND verify_token_hash = ? AND verify_token_expires_at > datetime('now')
@@ -864,37 +889,42 @@ app.post('/api/auth/forgot-password/reset', authLimiter, (req, res) => {
     return res.status(403).json({ error: 'Please verify your email again — the verification has expired.' });
   }
 
-  const user = db.prepare('SELECT * FROM users WHERE email = ? AND is_active = 1').get(email);
+  const user = await db.prepare('SELECT * FROM users WHERE email = ? AND is_active = 1').get(email);
   if (!user) return res.status(404).json({ error: 'No account found with that email address.' });
 
-  db.transaction(() => {
-    db.prepare('UPDATE users SET password_hash = ?, failed_attempts = 0, locked_until = NULL WHERE id = ?').run(bcrypt.hashSync(body.newPassword, BCRYPT_ROUNDS), user.id);
-    db.prepare("UPDATE otp_codes SET consumed_at = datetime('now') WHERE id = ?").run(otpRow.id);
-    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id);   // sign the account out everywhere, for safety
+  await db.transaction(async () => {
+    await db.prepare('UPDATE users SET password_hash = ?, failed_attempts = 0, locked_until = NULL WHERE id = ?').run(bcrypt.hashSync(body.newPassword, BCRYPT_ROUNDS), user.id);
+    await db.prepare("UPDATE otp_codes SET consumed_at = datetime('now') WHERE id = ?").run(otpRow.id);
+    await db.prepare('DELETE FROM sessions WHERE user_id = ?').run(user.id);   // sign the account out everywhere, for safety
   })();
 
   res.json({ ok: true, username: user.username });
 });
 
 // ---------------------------------------------------------------------
-// API ROUTES: every .js file inside the "routes" folder is loaded
-// automatically, so later steps only add new files there.
+// API ROUTES
 // ---------------------------------------------------------------------
-const routeContext = {
+// NOTE: this used to be `fs.readdirSync('routes').forEach(f =>
+// require(...))` — convenient locally, but Vercel's build step uses
+// static analysis (file tracing) to decide which files to bundle into
+// the serverless function, and a require() built from a runtime string
+// is invisible to that analysis. Locally every file in routes/ exists
+// on disk so `node server.js` works fine either way; on Vercel the
+// routes/*.js files silently never made it into the deployed bundle,
+// so the very first request hit "Cannot find module './routes/...'"
+// and crashed the function — that's the 500 FUNCTION_INVOCATION_FAILED
+// you saw. Explicit requires below fix that, at the cost of one extra
+// line here whenever a new routes/*.js file is added.
+[
+  require('./routes/backup.js'),
+  require('./routes/borrowers-loans.js'),
+  require('./routes/dashboard.js'),
+  require('./routes/payments.js'),
+].forEach((registerRoutes) => registerRoutes({
   app, db, requireAuth, audit, HttpError,
   toPaise, toRupees, isDate, todayStr, addDays, addMonths,
-  DATA_DIR, BACKUP_DIR, DB_FILE, offsiteBackupConfigured,
-};
-const ROUTES_DIR = path.join(__dirname, 'routes');
-if (fs.existsSync(ROUTES_DIR)) {
-  fs.readdirSync(ROUTES_DIR)
-    .filter((f) => f.endsWith('.js'))
-    .sort()
-    .forEach((f) => {
-      require(path.join(ROUTES_DIR, f))(routeContext);
-      console.log(`Loaded routes: ${f}`);
-    });
-}
+  DATA_DIR, BACKUP_DIR, offsiteBackupConfigured,
+}));
 
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found.' }));
 
@@ -960,28 +990,32 @@ app.use((err, req, res, next) => {
 });
 
 // ---------------------------------------------------------------------
-// AUTOMATIC BACKUPS (every 6 hours, keeps the last 30 days)
+// AUTOMATIC BACKUPS (every 6 hours, keeps the last 30 days of dumps)
+// NOTE: on Vercel/serverless hosting this setInterval will NOT reliably
+// fire — a serverless function doesn't stay running between requests.
+// Treat this as a convenience for a traditional always-on host (Render,
+// Railway, a VPS, etc.); on Vercel, rely on Turso's own backups/branching
+// for point-in-time recovery instead, and use the on-demand
+// /api/backup/download route (which works anywhere) for manual snapshots.
 // ---------------------------------------------------------------------
 async function runBackup() {
   try {
     fs.mkdirSync(BACKUP_DIR, { recursive: true });
     const day = new Date().toISOString().slice(0, 10);
-    const fileName = `vault-${day}.db`;
+    const fileName = `vault-${day}.sql`;
     const filePath = path.join(BACKUP_DIR, fileName);
-    await db.backup(filePath);
+    await db.dumpToFile(filePath, fs);
     await sendBackupOffsite(filePath, fileName);
 
     const files = fs
       .readdirSync(BACKUP_DIR)
-      .filter((f) => /^vault-\d{4}-\d{2}-\d{2}\.db$/.test(f))
+      .filter((f) => /^vault-\d{4}-\d{2}-\d{2}\.sql$/.test(f))
       .sort();
     while (files.length > 30) fs.unlinkSync(path.join(BACKUP_DIR, files.shift()));
   } catch (err) {
     console.error('Backup failed:', err.message);
   }
 }
-runBackup();
-setInterval(runBackup, 6 * 60 * 60 * 1000);
 
 // ---------------------------------------------------------------------
 // PRODUCTION CHECKLIST — friendly reminders printed once at startup so
@@ -995,32 +1029,58 @@ if (IS_PROD) {
     console.warn('[Vault] WARNING: No SMS_PROVIDER is set — OTP codes print to this log instead of being texted. Set SMS_PROVIDER (fast2sms, whatsapp, or webhook) before going live.');
   }
   if (!process.env.BACKUP_WEBHOOK_URL) {
-    console.warn('[Vault] NOTE: No off-site backup is configured (BACKUP_WEBHOOK_URL). Local backups protect against a corrupted database, but not a lost, stolen, or destroyed computer. See DEPLOYMENT.md.');
+    console.warn('[Vault] NOTE: No off-site backup is configured (BACKUP_WEBHOOK_URL). On Vercel, prefer Turso\'s own backups — see DEPLOYMENT.md.');
   }
 }
 
 // Remove expired login sessions once an hour
-function cleanSessions() {
-  db.prepare("DELETE FROM sessions WHERE expires_at <= datetime('now')").run();
+async function cleanSessions() {
+  try {
+    await db.prepare("DELETE FROM sessions WHERE expires_at <= datetime('now')").run();
+  } catch (err) {
+    console.error('cleanSessions failed:', err.message);
+  }
 }
-cleanSessions();
-setInterval(cleanSessions, 60 * 60 * 1000);
 
 // ---------------------------------------------------------------------
 // START + SAFE SHUTDOWN
+// Migrations must finish before anything touches the database, so
+// everything below waits on runMigrations().
 // ---------------------------------------------------------------------
-const server = app.listen(PORT, () => {
-  console.log(`Vault is running:  http://localhost:${PORT}`);
-  console.log(`Database file:     ${DB_FILE}`);
-});
+let server = null;
+const ready = runMigrations()
+  .then(() => {
+    // Only auto-listen when this file is run directly (`node server.js`)
+    // — a traditional host. On Vercel, this file is imported by a
+    // serverless entry point instead, so it should just export `app`.
+    if (require.main === module) {
+      runBackup();
+      setInterval(runBackup, 6 * 60 * 60 * 1000).unref();
+      cleanSessions();
+      setInterval(cleanSessions, 60 * 60 * 1000).unref();
+      server = app.listen(PORT, () => {
+        console.log(`Vault is running:  http://localhost:${PORT}`);
+      });
+    }
+  })
+  .catch((err) => {
+    console.error('[Vault] Failed to start (migrations):', err);
+    process.exit(1);
+  });
 
 function shutdown() {
   console.log('Shutting down safely...');
-  server.close(() => {
-    try { db.close(); } catch (e) { /* ignore */ }
+  if (server) {
+    server.close(() => {
+      try { db.close(); } catch (e) { /* ignore */ }
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 5000).unref();
+  } else {
     process.exit(0);
-  });
-  setTimeout(() => process.exit(1), 5000).unref();
+  }
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+module.exports = { app, ready };

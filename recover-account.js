@@ -3,6 +3,12 @@
 //  forgotten password. Run this from the project folder (same place
 //  as server.js) — it reuses your existing node_modules.
 //
+//  Needs the same TURSO_DATABASE_URL / TURSO_AUTH_TOKEN environment
+//  variables as server.js, since accounts now live in Turso, not in a
+//  local data/vault.db file. Easiest way to set them for one run:
+//    TURSO_DATABASE_URL=... TURSO_AUTH_TOKEN=... node recover-account.js
+//  (or `source` a .env file first, however you normally load one)
+//
 //  See who your accounts are:
 //    node recover-account.js
 //
@@ -14,26 +20,26 @@
 // =====================================================================
 'use strict';
 
-const path = require('path');
 const readline = require('readline');
-const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
+const { makeDb } = require('./lib/db');
 
 const BCRYPT_ROUNDS = 12;
-const DB_PATH = path.join(__dirname, 'data', 'vault.db');
 
 function openDb() {
-  try {
-    return new Database(DB_PATH, { fileMustExist: true });
-  } catch (err) {
-    console.error(`\nCouldn't open the database at ${DB_PATH}`);
-    console.error('Make sure you run this from the same folder as server.js, and that the app has been set up at least once.\n');
+  if (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN) {
+    console.error('\nMissing TURSO_DATABASE_URL / TURSO_AUTH_TOKEN environment variables.');
+    console.error('Set the same two variables you use for server.js, then run this again.\n');
     process.exit(1);
   }
+  return makeDb({
+    url: process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+  });
 }
 
-function listAccounts(db) {
-  const users = db.prepare('SELECT username, full_name, role, is_active, last_login_at FROM users ORDER BY id').all();
+async function listAccounts(db) {
+  const users = await db.prepare('SELECT username, full_name, role, is_active, last_login_at FROM users ORDER BY id').all();
   if (users.length === 0) {
     console.log('\nNo accounts found yet — the app has not been set up.\n');
     return;
@@ -70,7 +76,7 @@ function askTwoLines(rl, prompt1, prompt2) {
 
 async function resetPassword(db, username) {
   const uname = String(username || '').trim().toLowerCase();
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(uname);
+  const user = await db.prepare('SELECT * FROM users WHERE username = ?').get(uname);
   if (!user) {
     console.error(`\nNo account found with username "${uname}". Run "node recover-account.js" with no arguments to see the list.\n`);
     process.exit(1);
@@ -92,7 +98,7 @@ async function resetPassword(db, username) {
   }
 
   const hash = bcrypt.hashSync(pw1, BCRYPT_ROUNDS);
-  db.prepare('UPDATE users SET password_hash = ?, updated_at = datetime(\'now\') WHERE id = ?').run(hash, user.id);
+  await db.prepare('UPDATE users SET password_hash = ?, updated_at = datetime(\'now\') WHERE id = ?').run(hash, user.id);
   console.log(`\nDone — the password for "${user.username}" has been reset. You can log in with it now.\n`);
 }
 
@@ -100,16 +106,19 @@ async function main() {
   const db = openDb();
   const [, , cmd, arg] = process.argv;
 
-  if (cmd === 'reset') {
-    if (!arg) {
-      console.error('\nUsage: node recover-account.js reset <username>\n');
-      process.exit(1);
+  try {
+    if (cmd === 'reset') {
+      if (!arg) {
+        console.error('\nUsage: node recover-account.js reset <username>\n');
+        process.exit(1);
+      }
+      await resetPassword(db, arg);
+    } else {
+      await listAccounts(db);
     }
-    await resetPassword(db, arg);
-  } else {
-    listAccounts(db);
+  } finally {
+    db.close();
   }
-  db.close();
 }
 
 main();

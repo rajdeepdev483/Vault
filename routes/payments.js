@@ -105,10 +105,10 @@ module.exports = function (ctx) {
 
   // Interest on a loan up to (and not including) the date asOf. All money in paise.
   // receivedUpTo: count interest payments made on or before this date.
-  function computeInterest(loan, asOf, receivedUpTo) {
+  async function computeInterest(loan, asOf, receivedUpTo) {
     const start = loan.start_date;
     const end = asOf < start ? start : asOf;
-    const txns = db
+    const txns = await db
       .prepare(
         `SELECT type, amount, txn_date FROM transactions
           WHERE loan_id = ? AND is_voided = 0
@@ -137,12 +137,12 @@ module.exports = function (ctx) {
     addSegment(cursor, end);
 
     const accrued = segments.reduce((sum, s) => sum + s.interest, 0);
-    const received = db
+    const received = (await db
       .prepare(
         `SELECT COALESCE(SUM(amount), 0) AS s FROM transactions
           WHERE loan_id = ? AND is_voided = 0 AND type = 'interest_payment' AND txn_date <= ?`
       )
-      .get(loan.id, receivedUpTo || end).s;
+      .get(loan.id, receivedUpTo || end)).s;
 
     return { asOf: end, segments, accrued, received, pending: accrued - received, outstanding: balance };
   }
@@ -190,8 +190,8 @@ module.exports = function (ctx) {
          JOIN borrowers b ON b.id = l.borrower_id
         WHERE t.id = ? AND b.owner_id = ?`
     ).get(id, ownerId);
-  const initialDisbursementId = (loanId) =>
-    (db.prepare("SELECT id FROM transactions WHERE loan_id = ? AND type = 'disbursement' ORDER BY id LIMIT 1").get(loanId) || {}).id;
+  const initialDisbursementId = async (loanId) =>
+    ((await db.prepare("SELECT id FROM transactions WHERE loan_id = ? AND type = 'disbursement' ORDER BY id LIMIT 1").get(loanId)) || {}).id;
 
   function txnOut(t) {
     return {
@@ -213,8 +213,8 @@ module.exports = function (ctx) {
   }
 
   // Quick numbers for the loan after any change
-  function snapshot(loanId, ownerId) {
-    const l = db
+  async function snapshot(loanId, ownerId) {
+    const l = await db
       .prepare(
         `SELECT l.*, s.total_lent, s.principal_repaid, s.outstanding_principal, s.interest_received
            FROM loans l JOIN loan_summary s ON s.loan_id = l.id
@@ -222,7 +222,7 @@ module.exports = function (ctx) {
       )
       .get(loanId, ownerId);
     const asOf = l.status === 'closed' && l.closed_date ? l.closed_date : todayStr();
-    const it = computeInterest(l, asOf);
+    const it = await computeInterest(l, asOf);
     return {
       id: l.id,
       status: l.status,
@@ -243,9 +243,9 @@ module.exports = function (ctx) {
   // dated before the loan started. If the check fails the whole change
   // is undone (it runs inside a database transaction).
   // -------------------------------------------------------------------
-  function assertLedgerOk(loanId, ownerId) {
-    const loan = getLoan(loanId, ownerId);
-    const rows = db
+  async function assertLedgerOk(loanId, ownerId) {
+    const loan = await getLoan(loanId, ownerId);
+    const rows = await db
       .prepare(
         `SELECT type, amount, txn_date FROM transactions
           WHERE loan_id = ? AND is_voided = 0 AND type IN ('disbursement','topup','principal_payment')
@@ -262,9 +262,9 @@ module.exports = function (ctx) {
         );
       }
     }
-    const earliest = db
+    const earliest = (await db
       .prepare('SELECT MIN(txn_date) AS m FROM transactions WHERE loan_id = ? AND is_voided = 0')
-      .get(loanId).m;
+      .get(loanId)).m;
     if (earliest && earliest < loan.start_date) {
       throw new HttpError(409, `An entry would be dated before the loan start date (${loan.start_date}).`);
     }
@@ -278,8 +278,8 @@ module.exports = function (ctx) {
 
   // After interest is paid, move the next due date forward while the
   // interest received covers the interest owed up to that due date.
-  function advanceDueDate(loanId, ownerId) {
-    const loan = getLoan(loanId, ownerId);
+  async function advanceDueDate(loanId, ownerId) {
+    const loan = await getLoan(loanId, ownerId);
     if (!loan.next_due_date || loan.payment_frequency === 'custom') return null;
 
     const step = (d) =>
@@ -290,24 +290,24 @@ module.exports = function (ctx) {
     let due = loan.next_due_date;
     let moved = false;
     for (let i = 0; i < 60; i++) {
-      const it = computeInterest(loan, due, todayStr());
+      const it = await computeInterest(loan, due, todayStr());
       const covered = it.accrued > 0 && it.received + 100 >= it.accrued;   // Rs 1 tolerance for rounding
       if (!covered) break;
       due = step(due);
       moved = true;
     }
     if (!moved) return null;
-    db.prepare('UPDATE loans SET next_due_date = ? WHERE id = ?').run(due, loanId);
+    await db.prepare('UPDATE loans SET next_due_date = ? WHERE id = ?').run(due, loanId);
     return due;
   }
 
   // -------------------------------------------------------------------
   // RECORD A PAYMENT / TOP-UP
   // -------------------------------------------------------------------
-  app.post('/api/loans/:id/transactions', requireAuth, (req, res) => {
+  app.post('/api/loans/:id/transactions', requireAuth, async (req, res) => {
     const loanId = parseId(req.params.id, 'loan ID');
     const body = asObject(req.body);
-    const loan = getLoan(loanId, req.user.id);
+    const loan = await getLoan(loanId, req.user.id);
     if (!loan) throw notFound('Loan');
     assertLoanOpen(loan);
 
@@ -331,8 +331,8 @@ module.exports = function (ctx) {
     const autoAdvance = type === 'interest_payment' && body.advanceDueDate !== false;
 
     let movedTo = null;
-    const txnId = db.transaction(() => {
-      const info = db
+    const txnId = await db.transaction(async () => {
+      const info = await db
         .prepare(
           `INSERT INTO transactions (loan_id, type, amount, txn_date, method, reference_no,
                                      interest_from, interest_to, note, created_by)
@@ -341,32 +341,32 @@ module.exports = function (ctx) {
         .run(loanId, type, toPaise(amount), date, method, referenceNo, interestFrom, interestTo, note, req.user.id);
       const id = Number(info.lastInsertRowid);
 
-      assertLedgerOk(loanId, req.user.id);
-      audit(req.user.id, 'transactions', id, 'create', null, getTxn(id, req.user.id));
+      await assertLedgerOk(loanId, req.user.id);
+      await audit(req.user.id, 'transactions', id, 'create', null, await getTxn(id, req.user.id));
 
-      if (autoAdvance && manualDue === undefined) movedTo = advanceDueDate(loanId, req.user.id);
+      if (autoAdvance && manualDue === undefined) movedTo = await advanceDueDate(loanId, req.user.id);
       if (manualDue !== undefined) {
-        const before = getLoan(loanId, req.user.id);
-        db.prepare('UPDATE loans SET next_due_date = ? WHERE id = ?').run(manualDue, loanId);
-        audit(req.user.id, 'loans', loanId, 'update', before, getLoan(loanId, req.user.id));
+        const before = await getLoan(loanId, req.user.id);
+        await db.prepare('UPDATE loans SET next_due_date = ? WHERE id = ?').run(manualDue, loanId);
+        await audit(req.user.id, 'loans', loanId, 'update', before, await getLoan(loanId, req.user.id));
       } else if (movedTo) {
         // record the automatic due-date move in the audit log too
-        audit(req.user.id, 'loans', loanId, 'update', loan, getLoan(loanId, req.user.id));
+        await audit(req.user.id, 'loans', loanId, 'update', loan, await getLoan(loanId, req.user.id));
       }
       return id;
     })();
 
-    const snap = snapshot(loanId, req.user.id);
+    const snap = await snapshot(loanId, req.user.id);
     res.status(201).json({
-      transaction: txnOut(getTxn(txnId, req.user.id)),
+      transaction: txnOut(await getTxn(txnId, req.user.id)),
       loan: snap,
       dueDateMovedTo: movedTo,
       principalFullyRepaid: type === 'principal_payment' && snap.outstandingPrincipal === 0,
     });
   });
 
-  app.get('/api/transactions/:id', requireAuth, (req, res) => {
-    const t = getTxn(parseId(req.params.id, 'transaction ID'), req.user.id);
+  app.get('/api/transactions/:id', requireAuth, async (req, res) => {
+    const t = await getTxn(parseId(req.params.id, 'transaction ID'), req.user.id);
     if (!t) throw notFound('Transaction');
     res.json({ transaction: txnOut(t) });
   });
@@ -374,16 +374,16 @@ module.exports = function (ctx) {
   // -------------------------------------------------------------------
   // EDIT / VOID / RESTORE
   // -------------------------------------------------------------------
-  app.patch('/api/transactions/:id', requireAuth, (req, res) => {
+  app.patch('/api/transactions/:id', requireAuth, async (req, res) => {
     const id = parseId(req.params.id, 'transaction ID');
     const body = asObject(req.body);
-    const before = getTxn(id, req.user.id);
+    const before = await getTxn(id, req.user.id);
     if (!before) throw notFound('Transaction');
-    const loan = getLoan(before.loan_id, req.user.id);
+    const loan = await getLoan(before.loan_id, req.user.id);
     assertLoanOpen(loan);
     if (before.is_voided) throw new HttpError(409, 'This entry is voided. Restore it before editing.');
 
-    const isInitial = before.type === 'disbursement' && initialDisbursementId(before.loan_id) === id;
+    const isInitial = before.type === 'disbursement' && (await initialDisbursementId(before.loan_id)) === id;
     const data = {};
 
     if ('amount' in body) data.amount = toPaise(cleanNumber(body.amount, 'Amount', { min: 0.01, max: 1e9, required: true }));
@@ -407,52 +407,52 @@ module.exports = function (ctx) {
 
     const changed = Object.keys(data).filter((c) => (before[c] ?? null) !== data[c]);
     if (changed.length) {
-      db.transaction(() => {
+      await db.transaction(async () => {
         const values = { id };
         for (const c of changed) values[c] = data[c];
-        db.prepare(`UPDATE transactions SET ${changed.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run(values);
+        await db.prepare(`UPDATE transactions SET ${changed.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run(values);
 
         // The first disbursement defines the loan's start date
         if (isInitial && 'txn_date' in data && data.txn_date !== loan.start_date) {
-          db.prepare('UPDATE loans SET start_date = ? WHERE id = ?').run(data.txn_date, before.loan_id);
+          await db.prepare('UPDATE loans SET start_date = ? WHERE id = ?').run(data.txn_date, before.loan_id);
         }
-        assertLedgerOk(before.loan_id, req.user.id);
-        audit(req.user.id, 'transactions', id, 'update', before, getTxn(id, req.user.id));
+        await assertLedgerOk(before.loan_id, req.user.id);
+        await audit(req.user.id, 'transactions', id, 'update', before, await getTxn(id, req.user.id));
       })();
     }
-    res.json({ transaction: txnOut(getTxn(id, req.user.id)), loan: snapshot(before.loan_id, req.user.id) });
+    res.json({ transaction: txnOut(await getTxn(id, req.user.id)), loan: await snapshot(before.loan_id, req.user.id) });
   });
 
-  app.post('/api/transactions/:id/void', requireAuth, (req, res) => {
+  app.post('/api/transactions/:id/void', requireAuth, async (req, res) => {
     const id = parseId(req.params.id, 'transaction ID');
     const reason = cleanText(asObject(req.body).reason, 'Reason', 200) ?? null;
-    const before = getTxn(id, req.user.id);
+    const before = await getTxn(id, req.user.id);
     if (!before) throw notFound('Transaction');
-    assertLoanOpen(getLoan(before.loan_id, req.user.id));
-    if (before.is_voided) return res.json({ transaction: txnOut(before), loan: snapshot(before.loan_id, req.user.id) });
-    if (before.type === 'disbursement' && initialDisbursementId(before.loan_id) === id) {
+    assertLoanOpen(await getLoan(before.loan_id, req.user.id));
+    if (before.is_voided) return res.json({ transaction: txnOut(before), loan: await snapshot(before.loan_id, req.user.id) });
+    if (before.type === 'disbursement' && (await initialDisbursementId(before.loan_id)) === id) {
       throw new HttpError(409, 'The first payout of a loan cannot be voided. Edit its amount instead.');
     }
-    db.transaction(() => {
-      db.prepare('UPDATE transactions SET is_voided = 1, voided_reason = ? WHERE id = ?').run(reason, id);
-      assertLedgerOk(before.loan_id, req.user.id);
-      audit(req.user.id, 'transactions', id, 'void', before, getTxn(id, req.user.id));
+    await db.transaction(async () => {
+      await db.prepare('UPDATE transactions SET is_voided = 1, voided_reason = ? WHERE id = ?').run(reason, id);
+      await assertLedgerOk(before.loan_id, req.user.id);
+      await audit(req.user.id, 'transactions', id, 'void', before, await getTxn(id, req.user.id));
     })();
-    res.json({ transaction: txnOut(getTxn(id, req.user.id)), loan: snapshot(before.loan_id, req.user.id) });
+    res.json({ transaction: txnOut(await getTxn(id, req.user.id)), loan: await snapshot(before.loan_id, req.user.id) });
   });
 
-  app.post('/api/transactions/:id/restore', requireAuth, (req, res) => {
+  app.post('/api/transactions/:id/restore', requireAuth, async (req, res) => {
     const id = parseId(req.params.id, 'transaction ID');
-    const before = getTxn(id, req.user.id);
+    const before = await getTxn(id, req.user.id);
     if (!before) throw notFound('Transaction');
-    assertLoanOpen(getLoan(before.loan_id, req.user.id));
-    if (!before.is_voided) return res.json({ transaction: txnOut(before), loan: snapshot(before.loan_id, req.user.id) });
-    db.transaction(() => {
-      db.prepare('UPDATE transactions SET is_voided = 0, voided_reason = NULL WHERE id = ?').run(id);
-      assertLedgerOk(before.loan_id, req.user.id);
-      audit(req.user.id, 'transactions', id, 'restore', before, getTxn(id, req.user.id));
+    assertLoanOpen(await getLoan(before.loan_id, req.user.id));
+    if (!before.is_voided) return res.json({ transaction: txnOut(before), loan: await snapshot(before.loan_id, req.user.id) });
+    await db.transaction(async () => {
+      await db.prepare('UPDATE transactions SET is_voided = 0, voided_reason = NULL WHERE id = ?').run(id);
+      await assertLedgerOk(before.loan_id, req.user.id);
+      await audit(req.user.id, 'transactions', id, 'restore', before, await getTxn(id, req.user.id));
     })();
-    res.json({ transaction: txnOut(getTxn(id, req.user.id)), loan: snapshot(before.loan_id, req.user.id) });
+    res.json({ transaction: txnOut(await getTxn(id, req.user.id)), loan: await snapshot(before.loan_id, req.user.id) });
   });
 
   // -------------------------------------------------------------------
@@ -463,19 +463,19 @@ module.exports = function (ctx) {
   }
 
   // ?asOf=YYYY-MM-DD lets you see the position on any date (even a future one)
-  app.get('/api/loans/:id/interest', requireAuth, (req, res) => {
-    const loan = getLoan(parseId(req.params.id, 'loan ID'), req.user.id);
+  app.get('/api/loans/:id/interest', requireAuth, async (req, res) => {
+    const loan = await getLoan(parseId(req.params.id, 'loan ID'), req.user.id);
     if (!loan) throw notFound('Loan');
     const asOf = cleanDate(req.query.asOf || undefined, 'asOf') || defaultAsOf(loan);
-    res.json({ interest: interestOut(loan, computeInterest(loan, asOf)) });
+    res.json({ interest: interestOut(loan, await computeInterest(loan, asOf)) });
   });
 
-  app.get('/api/loans/:id/statement', requireAuth, (req, res) => {
-    const loan = getLoan(parseId(req.params.id, 'loan ID'), req.user.id);
+  app.get('/api/loans/:id/statement', requireAuth, async (req, res) => {
+    const loan = await getLoan(parseId(req.params.id, 'loan ID'), req.user.id);
     if (!loan) throw notFound('Loan');
-    const borrower = db.prepare('SELECT id, full_name, phone FROM borrowers WHERE id = ?').get(loan.borrower_id);
+    const borrower = await db.prepare('SELECT id, full_name, phone FROM borrowers WHERE id = ?').get(loan.borrower_id);
 
-    const rows = db
+    const rows = await db
       .prepare(
         `SELECT * FROM transactions WHERE loan_id = ?
           ORDER BY txn_date ASC, CASE type WHEN 'principal_payment' THEN 1 ELSE 0 END, id ASC`
@@ -509,7 +509,7 @@ module.exports = function (ctx) {
         nextDueDate: loan.next_due_date,
       },
       borrower: { id: borrower.id, fullName: borrower.full_name, phone: borrower.phone },
-      interest: interestOut(loan, computeInterest(loan, defaultAsOf(loan))),
+      interest: interestOut(loan, await computeInterest(loan, defaultAsOf(loan))),
       entries,
     });
   });

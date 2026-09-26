@@ -161,10 +161,10 @@ module.exports = function ({ app, db, requireAuth, audit, HttpError, toPaise, to
   const getLoanRow = (id, ownerId) =>
     db.prepare(`${LOAN_SELECT} JOIN borrowers ob ON ob.id = l.borrower_id WHERE l.id = ? AND ob.owner_id = ?`).get(id, ownerId);
 
-  function borrowerDetail(id, ownerId) {
-    const b = getBorrowerRow(id, ownerId);
+  async function borrowerDetail(id, ownerId) {
+    const b = await getBorrowerRow(id, ownerId);
     if (!b) throw notFound('Borrower');
-    const rawLoans = db.prepare(`${LOAN_SELECT} WHERE l.borrower_id = ? ORDER BY l.cycle_number DESC`).all(id);
+    const rawLoans = await db.prepare(`${LOAN_SELECT} WHERE l.borrower_id = ? ORDER BY l.cycle_number DESC`).all(id);
     const activeOutstanding = rawLoans
       .filter((l) => l.status === 'active')
       .reduce((sum, l) => sum + l.outstanding_principal, 0);
@@ -221,7 +221,7 @@ module.exports = function ({ app, db, requireAuth, audit, HttpError, toPaise, to
   }
 
   // List / search borrowers, each with a quick money summary
-  app.get('/api/borrowers', requireAuth, (req, res) => {
+  app.get('/api/borrowers', requireAuth, async (req, res) => {
     const archived = req.query.archived === '1' ? 1 : req.query.archived === 'all' ? null : 0;
     const search = String(req.query.search || '').trim();
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
@@ -246,8 +246,8 @@ module.exports = function ({ app, db, requireAuth, audit, HttpError, toPaise, to
     }
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
-    const total = db.prepare(`SELECT COUNT(*) AS c FROM borrowers b ${whereSql}`).get(params).c;
-    const rows = db
+    const total = (await db.prepare(`SELECT COUNT(*) AS c FROM borrowers b ${whereSql}`).get(params)).c;
+    const rows = await db
       .prepare(
         `SELECT b.*,
            (SELECT COUNT(*) FROM loans l WHERE l.borrower_id = b.id) AS total_cycles,
@@ -266,82 +266,82 @@ module.exports = function ({ app, db, requireAuth, audit, HttpError, toPaise, to
     res.json({ total, borrowers: rows.map(borrowerOut) });
   });
 
-  app.post('/api/borrowers', requireAuth, (req, res) => {
+  app.post('/api/borrowers', requireAuth, async (req, res) => {
     const data = parseBorrowerBody(asObject(req.body), false);
     data.owner_id = req.user.id;
     const cols = Object.keys(data);
 
-    const id = db.transaction(() => {
-      const info = db
+    const id = await db.transaction(async () => {
+      const info = await db
         .prepare(`INSERT INTO borrowers (${cols.join(', ')}) VALUES (${cols.map((c) => '@' + c).join(', ')})`)
         .run(data);
       const newId = Number(info.lastInsertRowid);
-      audit(req.user.id, 'borrowers', newId, 'create', null, getBorrowerRow(newId, req.user.id));
+      await audit(req.user.id, 'borrowers', newId, 'create', null, await getBorrowerRow(newId, req.user.id));
       return newId;
     })();
 
-    res.status(201).json({ borrower: borrowerDetail(id, req.user.id) });
+    res.status(201).json({ borrower: await borrowerDetail(id, req.user.id) });
   });
 
-  app.get('/api/borrowers/:id', requireAuth, (req, res) => {
-    res.json({ borrower: borrowerDetail(parseId(req.params.id, 'borrower ID'), req.user.id) });
+  app.get('/api/borrowers/:id', requireAuth, async (req, res) => {
+    res.json({ borrower: await borrowerDetail(parseId(req.params.id, 'borrower ID'), req.user.id) });
   });
 
-  app.patch('/api/borrowers/:id', requireAuth, (req, res) => {
+  app.patch('/api/borrowers/:id', requireAuth, async (req, res) => {
     const id = parseId(req.params.id, 'borrower ID');
-    const before = getBorrowerRow(id, req.user.id);
+    const before = await getBorrowerRow(id, req.user.id);
     if (!before) throw notFound('Borrower');
 
     const data = parseBorrowerBody(asObject(req.body), true);
     const changed = Object.keys(data).filter((c) => (before[c] ?? null) !== data[c]);
 
     if (changed.length) {
-      db.transaction(() => {
+      await db.transaction(async () => {
         const sets = changed.map((c) => `${c} = @${c}`).join(', ');
         const values = { id };
         for (const c of changed) values[c] = data[c];
-        db.prepare(`UPDATE borrowers SET ${sets} WHERE id = @id`).run(values);
-        audit(req.user.id, 'borrowers', id, 'update', before, getBorrowerRow(id, req.user.id));
+        await db.prepare(`UPDATE borrowers SET ${sets} WHERE id = @id`).run(values);
+        await audit(req.user.id, 'borrowers', id, 'update', before, await getBorrowerRow(id, req.user.id));
       })();
     }
-    res.json({ borrower: borrowerDetail(id, req.user.id) });
+    res.json({ borrower: await borrowerDetail(id, req.user.id) });
   });
 
-  app.post('/api/borrowers/:id/archive', requireAuth, (req, res) => {
+  app.post('/api/borrowers/:id/archive', requireAuth, async (req, res) => {
     const id = parseId(req.params.id, 'borrower ID');
-    const before = getBorrowerRow(id, req.user.id);
+    const before = await getBorrowerRow(id, req.user.id);
     if (!before) throw notFound('Borrower');
-    if (before.is_archived) return res.json({ borrower: borrowerDetail(id, req.user.id) });
+    if (before.is_archived) return res.json({ borrower: await borrowerDetail(id, req.user.id) });
 
-    const active = db.prepare("SELECT COUNT(*) AS c FROM loans WHERE borrower_id = ? AND status = 'active'").get(id).c;
+    const active = (await db.prepare("SELECT COUNT(*) AS c FROM loans WHERE borrower_id = ? AND status = 'active'").get(id)).c;
     if (active > 0) {
       throw new HttpError(409, 'This borrower has an active loan. Close the loan before archiving.');
     }
-    db.transaction(() => {
-      db.prepare('UPDATE borrowers SET is_archived = 1 WHERE id = ?').run(id);
-      audit(req.user.id, 'borrowers', id, 'archive', before, getBorrowerRow(id, req.user.id));
+    await db.transaction(async () => {
+      await db.prepare('UPDATE borrowers SET is_archived = 1 WHERE id = ?').run(id);
+      await audit(req.user.id, 'borrowers', id, 'archive', before, await getBorrowerRow(id, req.user.id));
     })();
-    res.json({ borrower: borrowerDetail(id, req.user.id) });
+    res.json({ borrower: await borrowerDetail(id, req.user.id) });
   });
 
-  app.post('/api/borrowers/:id/restore', requireAuth, (req, res) => {
+  app.post('/api/borrowers/:id/restore', requireAuth, async (req, res) => {
     const id = parseId(req.params.id, 'borrower ID');
-    const before = getBorrowerRow(id, req.user.id);
+    const before = await getBorrowerRow(id, req.user.id);
     if (!before) throw notFound('Borrower');
     if (before.is_archived) {
-      db.transaction(() => {
-        db.prepare('UPDATE borrowers SET is_archived = 0 WHERE id = ?').run(id);
-        audit(req.user.id, 'borrowers', id, 'restore', before, getBorrowerRow(id, req.user.id));
+      await db.transaction(async () => {
+        await db.prepare('UPDATE borrowers SET is_archived = 0 WHERE id = ?').run(id);
+        await audit(req.user.id, 'borrowers', id, 'restore', before, await getBorrowerRow(id, req.user.id));
       })();
     }
-    res.json({ borrower: borrowerDetail(id, req.user.id) });
+    res.json({ borrower: await borrowerDetail(id, req.user.id) });
   });
 
   // -------------------------------------------------------------------
   // LOAN CYCLES
   // -------------------------------------------------------------------
-  const getSetting = (key, fallback) => {
-    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+  const getSetting = async (key, fallback) => {
+    const row = await db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
     return row && row.value !== null && row.value !== '' ? row.value : fallback;
   };
 
@@ -353,11 +353,11 @@ module.exports = function ({ app, db, requireAuth, audit, HttpError, toPaise, to
   }
 
   // Start a new loan cycle (records the first disbursement automatically)
-  app.post('/api/borrowers/:id/loans', requireAuth, (req, res) => {
+  app.post('/api/borrowers/:id/loans', requireAuth, async (req, res) => {
     const borrowerId = parseId(req.params.id, 'borrower ID');
     const body = asObject(req.body);
 
-    const borrower = getBorrowerRow(borrowerId, req.user.id);
+    const borrower = await getBorrowerRow(borrowerId, req.user.id);
     if (!borrower) throw notFound('Borrower');
     if (borrower.is_archived) throw new HttpError(409, 'This borrower is archived. Restore them first.');
 
@@ -365,9 +365,9 @@ module.exports = function ({ app, db, requireAuth, audit, HttpError, toPaise, to
     const startDate = cleanDate(body.startDate, 'Start date') || todayStr();
     const interestRate =
       cleanNumber(body.interestRate, 'Interest rate', { min: 0, max: 1000 }) ??
-      (Number(getSetting('default_interest_rate', '2')) || 2);
+      (Number(await getSetting('default_interest_rate', '2')) || 2);
     const ratePeriod =
-      cleanEnum(body.ratePeriod, 'Rate period', RATE_PERIODS) ?? getSetting('default_rate_period', 'monthly');
+      cleanEnum(body.ratePeriod, 'Rate period', RATE_PERIODS) ?? (await getSetting('default_rate_period', 'monthly'));
     const interestType = cleanEnum(body.interestType, 'Interest type', INTEREST_TYPES) ?? 'simple';
     const paymentFrequency = cleanEnum(body.paymentFrequency, 'Payment frequency', FREQUENCIES) ?? 'monthly';
 
@@ -380,18 +380,18 @@ module.exports = function ({ app, db, requireAuth, audit, HttpError, toPaise, to
     const referenceNo = cleanText(body.referenceNo, 'Reference number', 60) ?? null;
     const txnNote = cleanText(body.note, 'Note', 500) ?? null;
 
-    const loanId = db.transaction(() => {
-      if (db.prepare("SELECT 1 FROM loans WHERE borrower_id = ? AND status = 'active'").get(borrowerId)) {
+    const loanId = await db.transaction(async () => {
+      if (await db.prepare("SELECT 1 FROM loans WHERE borrower_id = ? AND status = 'active'").get(borrowerId)) {
         throw new HttpError(
           409,
           'This borrower already has an active loan cycle. Add a top-up to it, or close it before starting a new cycle.'
         );
       }
-      const cycle = db
+      const cycle = (await db
         .prepare('SELECT COALESCE(MAX(cycle_number), 0) + 1 AS n FROM loans WHERE borrower_id = ?')
-        .get(borrowerId).n;
+        .get(borrowerId)).n;
 
-      const info = db
+      const info = await db
         .prepare(
           `INSERT INTO loans (borrower_id, cycle_number, start_date, interest_rate, rate_period, interest_type,
                               payment_frequency, next_due_date, expected_amount, notes)
@@ -403,24 +403,24 @@ module.exports = function ({ app, db, requireAuth, audit, HttpError, toPaise, to
         );
       const newLoanId = Number(info.lastInsertRowid);
 
-      const txn = db
+      const txn = await db
         .prepare(
           `INSERT INTO transactions (loan_id, type, amount, txn_date, method, reference_no, note, created_by)
            VALUES (?, 'disbursement', ?, ?, ?, ?, ?, ?)`
         )
         .run(newLoanId, toPaise(principal), startDate, method, referenceNo, txnNote, req.user.id);
 
-      audit(req.user.id, 'loans', newLoanId, 'create', null, db.prepare('SELECT * FROM loans WHERE id = ?').get(newLoanId));
-      audit(req.user.id, 'transactions', Number(txn.lastInsertRowid), 'create', null,
-        db.prepare('SELECT * FROM transactions WHERE id = ?').get(txn.lastInsertRowid));
+      await audit(req.user.id, 'loans', newLoanId, 'create', null, await db.prepare('SELECT * FROM loans WHERE id = ?').get(newLoanId));
+      await audit(req.user.id, 'transactions', Number(txn.lastInsertRowid), 'create', null,
+        await db.prepare('SELECT * FROM transactions WHERE id = ?').get(txn.lastInsertRowid));
       return newLoanId;
     })();
 
-    res.status(201).json({ loan: loanOut(getLoanRow(loanId, req.user.id)) });
+    res.status(201).json({ loan: loanOut(await getLoanRow(loanId, req.user.id)) });
   });
 
   // List loans (used by the home page and the loans screen)
-  app.get('/api/loans', requireAuth, (req, res) => {
+  app.get('/api/loans', requireAuth, async (req, res) => {
     const status = cleanEnum(req.query.status || 'active', 'Status', [...STATUSES, 'all']);
     const dueBy = cleanDate(req.query.dueBy || undefined, 'dueBy');
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 500);
@@ -433,7 +433,7 @@ module.exports = function ({ app, db, requireAuth, audit, HttpError, toPaise, to
     if (dueBy) { where.push('l.next_due_date IS NOT NULL AND l.next_due_date <= @dueBy'); params.dueBy = dueBy; }
     const whereSql = `WHERE ${where.join(' AND ')}`;
 
-    const rows = db
+    const rows = await db
       .prepare(
         `SELECT l.*, s.total_lent, s.principal_repaid, s.outstanding_principal, s.interest_received,
                 b.full_name AS borrower_name, b.phone AS borrower_phone
@@ -449,12 +449,12 @@ module.exports = function ({ app, db, requireAuth, audit, HttpError, toPaise, to
     res.json({ loans: rows.map(loanOut) });
   });
 
-  app.get('/api/loans/:id', requireAuth, (req, res) => {
+  app.get('/api/loans/:id', requireAuth, async (req, res) => {
     const id = parseId(req.params.id, 'loan ID');
-    const row = getLoanRow(id, req.user.id);
+    const row = await getLoanRow(id, req.user.id);
     if (!row) throw notFound('Loan');
-    const borrower = getBorrowerRow(row.borrower_id, req.user.id);
-    const txns = db
+    const borrower = await getBorrowerRow(row.borrower_id, req.user.id);
+    const txns = await db
       .prepare('SELECT * FROM transactions WHERE loan_id = ? ORDER BY txn_date DESC, id DESC')
       .all(id);
 
@@ -466,10 +466,10 @@ module.exports = function ({ app, db, requireAuth, audit, HttpError, toPaise, to
   });
 
   // Edit loan settings. (Amounts lent/repaid are changed through transactions in Step 4.)
-  app.patch('/api/loans/:id', requireAuth, (req, res) => {
+  app.patch('/api/loans/:id', requireAuth, async (req, res) => {
     const id = parseId(req.params.id, 'loan ID');
     const body = asObject(req.body);
-    const beforeView = getLoanRow(id, req.user.id);
+    const beforeView = await getLoanRow(id, req.user.id);
     if (!beforeView) throw notFound('Loan');
 
     const data = {};
@@ -486,29 +486,29 @@ module.exports = function ({ app, db, requireAuth, audit, HttpError, toPaise, to
 
     const changed = Object.keys(data).filter((c) => (beforeView[c] ?? null) !== data[c]);
     if (changed.length) {
-      db.transaction(() => {
-        const before = db.prepare('SELECT * FROM loans WHERE id = ?').get(id);
+      await db.transaction(async () => {
+        const before = await db.prepare('SELECT * FROM loans WHERE id = ?').get(id);
         const values = { id };
         for (const c of changed) values[c] = data[c];
-        db.prepare(`UPDATE loans SET ${changed.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run(values);
-        audit(req.user.id, 'loans', id, 'update', before, db.prepare('SELECT * FROM loans WHERE id = ?').get(id));
+        await db.prepare(`UPDATE loans SET ${changed.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run(values);
+        await audit(req.user.id, 'loans', id, 'update', before, await db.prepare('SELECT * FROM loans WHERE id = ?').get(id));
       })();
     }
-    res.json({ loan: loanOut(getLoanRow(id, req.user.id)) });
+    res.json({ loan: loanOut(await getLoanRow(id, req.user.id)) });
   });
 
   // Close a cycle, reopen it, or mark it as defaulted
-  app.post('/api/loans/:id/status', requireAuth, (req, res) => {
+  app.post('/api/loans/:id/status', requireAuth, async (req, res) => {
     const id = parseId(req.params.id, 'loan ID');
     const body = asObject(req.body);
     const status = cleanEnum(body.status, 'Status', STATUSES, true);
 
-    const row = getLoanRow(id, req.user.id);
+    const row = await getLoanRow(id, req.user.id);
     if (!row) throw notFound('Loan');
     if (row.status === status) return res.json({ loan: loanOut(row) });
 
     if (status === 'active') {
-      const other = db
+      const other = await db
         .prepare("SELECT 1 FROM loans WHERE borrower_id = ? AND status = 'active' AND id <> ?")
         .get(row.borrower_id, id);
       if (other) throw new HttpError(409, 'This borrower already has another active loan cycle.');
@@ -525,12 +525,12 @@ module.exports = function ({ app, db, requireAuth, audit, HttpError, toPaise, to
       closedDate = cleanDate(body.closedDate, 'Closed date') || todayStr();
     }
 
-    db.transaction(() => {
-      const before = db.prepare('SELECT * FROM loans WHERE id = ?').get(id);
-      db.prepare('UPDATE loans SET status = ?, closed_date = ? WHERE id = ?').run(status, closedDate, id);
-      audit(req.user.id, 'loans', id, 'update', before, db.prepare('SELECT * FROM loans WHERE id = ?').get(id));
+    await db.transaction(async () => {
+      const before = await db.prepare('SELECT * FROM loans WHERE id = ?').get(id);
+      await db.prepare('UPDATE loans SET status = ?, closed_date = ? WHERE id = ?').run(status, closedDate, id);
+      await audit(req.user.id, 'loans', id, 'update', before, await db.prepare('SELECT * FROM loans WHERE id = ?').get(id));
     })();
 
-    res.json({ loan: loanOut(getLoanRow(id, req.user.id)) });
+    res.json({ loan: loanOut(await getLoanRow(id, req.user.id)) });
   });
 };
