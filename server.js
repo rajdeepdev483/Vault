@@ -915,16 +915,23 @@ app.post('/api/auth/forgot-password/reset', authLimiter, async (req, res) => {
 // and crashed the function — that's the 500 FUNCTION_INVOCATION_FAILED
 // you saw. Explicit requires below fix that, at the cost of one extra
 // line here whenever a new routes/*.js file is added.
-[
-  require('./routes/backup.js'),
-  require('./routes/borrowers-loans.js'),
-  require('./routes/dashboard.js'),
-  require('./routes/payments.js'),
-].forEach((registerRoutes) => registerRoutes({
+// One shared ctx object, passed by reference to every route module below.
+// This matters because payments.js attaches `ctx.interest = { computeInterest }`
+// onto it — if each module got its own freshly-built object literal instead
+// (as a `.forEach(registerRoutes => registerRoutes({ ... }))` would do), that
+// assignment would land on payments.js's private copy and dashboard.js would
+// never see it, however the require()s below are ordered.
+const routeCtx = {
   app, db, requireAuth, audit, HttpError,
   toPaise, toRupees, isDate, todayStr, addDays, addMonths,
   DATA_DIR, BACKUP_DIR, offsiteBackupConfigured,
-}));
+};
+[
+  require('./routes/backup.js'),
+  require('./routes/borrowers-loans.js'),
+  require('./routes/payments.js'),
+  require('./routes/dashboard.js'),
+].forEach((registerRoutes) => registerRoutes(routeCtx));
 
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found.' }));
 
