@@ -160,23 +160,20 @@ module.exports = function (ctx) {
       updatedAt: r.updated_at,
     };
   }
-  // Reminders belong to the account that created them, same as borrowers.
-  const getReminder = (id, ownerId) => db.prepare(`${REMINDER_SELECT} WHERE r.id = ? AND r.owner_id = ?`).get(id, ownerId);
-  const getReminderRaw = (id, ownerId) => db.prepare('SELECT * FROM reminders WHERE id = ? AND owner_id = ?').get(id, ownerId);
+  const getReminder = (id) => db.prepare(`${REMINDER_SELECT} WHERE r.id = ?`).get(id);
+  const getReminderRaw = (id) => db.prepare('SELECT * FROM reminders WHERE id = ?').get(id);
 
-  // Work out and check borrower/loan links (only within the caller's own records)
-  function resolveLinks(borrowerId, loanId, ownerId) {
+  // Work out and check borrower/loan links
+  function resolveLinks(borrowerId, loanId) {
     let b = borrowerId;
     let l = loanId;
     if (l) {
-      const loan = db
-        .prepare('SELECT l.id, l.borrower_id FROM loans l JOIN borrowers ob ON ob.id = l.borrower_id WHERE l.id = ? AND ob.owner_id = ?')
-        .get(l, ownerId);
+      const loan = db.prepare('SELECT id, borrower_id FROM loans WHERE id = ?').get(l);
       if (!loan) throw bad('That loan does not exist.');
       if (b && b !== loan.borrower_id) throw bad('That loan does not belong to that borrower.');
       b = loan.borrower_id;
     }
-    if (b && !db.prepare('SELECT 1 FROM borrowers WHERE id = ? AND owner_id = ?').get(b, ownerId)) throw bad('That borrower does not exist.');
+    if (b && !db.prepare('SELECT 1 FROM borrowers WHERE id = ?').get(b)) throw bad('That borrower does not exist.');
     return { borrowerId: b || null, loanId: l || null };
   }
 
@@ -186,8 +183,8 @@ module.exports = function (ctx) {
     const to = cleanDate(req.query.to || undefined, 'to');
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 500);
 
-    const where = ['r.owner_id = @ownerId'];
-    const params = { limit, ownerId: req.user.id };
+    const where = [];
+    const params = { limit };
     if (status !== 'all') { where.push('r.is_done = @done'); params.done = status === 'done' ? 1 : 0; }
     if (from) { where.push('r.remind_on >= @from'); params.from = from; }
     if (to) { where.push('r.remind_on <= @to'); params.to = to; }
@@ -195,7 +192,7 @@ module.exports = function (ctx) {
 
     const order = status === 'done' ? 'r.remind_on DESC, r.id DESC' : 'r.remind_on ASC, r.id ASC';
     const rows = db
-      .prepare(`${REMINDER_SELECT} WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT @limit`)
+      .prepare(`${REMINDER_SELECT} ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY ${order} LIMIT @limit`)
       .all(params);
     res.json({ reminders: rows.map(reminderOut) });
   });
@@ -207,25 +204,24 @@ module.exports = function (ctx) {
     const remindOn = cleanDate(body.remindOn, 'Reminder date', true);
     const links = resolveLinks(
       body.borrowerId ? parseId(body.borrowerId, 'borrower ID') : null,
-      body.loanId ? parseId(body.loanId, 'loan ID') : null,
-      req.user.id
+      body.loanId ? parseId(body.loanId, 'loan ID') : null
     );
 
     const id = db.transaction(() => {
       const info = db
-        .prepare('INSERT INTO reminders (borrower_id, loan_id, title, details, remind_on, owner_id) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(links.borrowerId, links.loanId, title, details, remindOn, req.user.id);
+        .prepare('INSERT INTO reminders (borrower_id, loan_id, title, details, remind_on) VALUES (?, ?, ?, ?, ?)')
+        .run(links.borrowerId, links.loanId, title, details, remindOn);
       const newId = Number(info.lastInsertRowid);
-      audit(req.user.id, 'reminders', newId, 'create', null, getReminderRaw(newId, req.user.id));
+      audit(req.user.id, 'reminders', newId, 'create', null, getReminderRaw(newId));
       return newId;
     })();
-    res.status(201).json({ reminder: reminderOut(getReminder(id, req.user.id)) });
+    res.status(201).json({ reminder: reminderOut(getReminder(id)) });
   });
 
   app.patch('/api/reminders/:id', requireAuth, (req, res) => {
     const id = parseId(req.params.id, 'reminder ID');
     const body = asObject(req.body);
-    const before = getReminderRaw(id, req.user.id);
+    const before = getReminderRaw(id);
     if (!before) throw notFound('Reminder');
 
     const data = {};
@@ -240,7 +236,7 @@ module.exports = function (ctx) {
       const bId = 'borrowerId' in body ? (body.borrowerId ? parseId(body.borrowerId, 'borrower ID') : null) : before.borrower_id;
       const lId = 'loanId' in body ? (body.loanId ? parseId(body.loanId, 'loan ID') : null) : before.loan_id;
       // if only the borrower changed, the old loan link no longer applies
-      const links = resolveLinks(bId, 'borrowerId' in body && !('loanId' in body) ? null : lId, req.user.id);
+      const links = resolveLinks(bId, 'borrowerId' in body && !('loanId' in body) ? null : lId);
       data.borrower_id = links.borrowerId;
       data.loan_id = links.loanId;
     }
@@ -251,17 +247,17 @@ module.exports = function (ctx) {
         const values = { id };
         for (const c of changed) values[c] = data[c];
         db.prepare(`UPDATE reminders SET ${changed.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`).run(values);
-        audit(req.user.id, 'reminders', id, 'update', before, getReminderRaw(id, req.user.id));
+        audit(req.user.id, 'reminders', id, 'update', before, getReminderRaw(id));
       })();
     }
-    res.json({ reminder: reminderOut(getReminder(id, req.user.id)) });
+    res.json({ reminder: reminderOut(getReminder(id)) });
   });
 
   // Reminders are personal notes (not money records), so they can be removed.
   // A full copy is still kept in the audit log.
   app.delete('/api/reminders/:id', requireAuth, (req, res) => {
     const id = parseId(req.params.id, 'reminder ID');
-    const before = getReminderRaw(id, req.user.id);
+    const before = getReminderRaw(id);
     if (!before) throw notFound('Reminder');
     db.transaction(() => {
       db.prepare('DELETE FROM reminders WHERE id = ?').run(id);
@@ -278,17 +274,13 @@ module.exports = function (ctx) {
     return Math.round((principal * loan.interest_rate * factor) / 100);
   };
 
-  function sumByType(from, to, ownerId) {
+  function sumByType(from, to) {
     const rows = db
       .prepare(
-        `SELECT t.type, COALESCE(SUM(t.amount), 0) AS s
-           FROM transactions t
-           JOIN loans l ON l.id = t.loan_id
-           JOIN borrowers b ON b.id = l.borrower_id
-          WHERE t.is_voided = 0 AND t.txn_date >= ? AND t.txn_date <= ? AND b.owner_id = ?
-          GROUP BY t.type`
+        `SELECT type, COALESCE(SUM(amount), 0) AS s FROM transactions
+          WHERE is_voided = 0 AND txn_date >= ? AND txn_date <= ? GROUP BY type`
       )
-      .all(from, to, ownerId);
+      .all(from, to);
     const m = Object.fromEntries(rows.map((r) => [r.type, r.s]));
     return {
       lent: (m.disbursement || 0) + (m.topup || 0),
@@ -312,9 +304,9 @@ module.exports = function (ctx) {
            FROM loans l
            JOIN loan_summary s ON s.loan_id = l.id
            JOIN borrowers b ON b.id = l.borrower_id
-          WHERE l.status = 'active' AND b.owner_id = ?`
+          WHERE l.status = 'active'`
       )
-      .all(req.user.id);
+      .all();
 
     let principalOut = 0;
     let pendingTotal = 0;
@@ -360,38 +352,29 @@ module.exports = function (ctx) {
     upcoming.sort((a, b) => a.dueDate.localeCompare(b.dueDate) || a.borrowerName.localeCompare(b.borrowerName));
 
     const defaulted = db
-      .prepare(
-        `SELECT COUNT(*) AS c, COALESCE(SUM(s.outstanding_principal), 0) AS p
-           FROM loan_summary s JOIN borrowers b ON b.id = s.borrower_id
-          WHERE s.status = 'defaulted' AND b.owner_id = ?`
-      )
-      .get(req.user.id);
+      .prepare("SELECT COUNT(*) AS c, COALESCE(SUM(outstanding_principal), 0) AS p FROM loan_summary WHERE status = 'defaulted'")
+      .get();
     const lifetime = db
-      .prepare(
-        `SELECT COALESCE(SUM(s.total_lent), 0) AS lent, COALESCE(SUM(s.interest_received), 0) AS interest
-           FROM loan_summary s JOIN borrowers b ON b.id = s.borrower_id
-          WHERE b.owner_id = ?`
-      )
-      .get(req.user.id);
+      .prepare('SELECT COALESCE(SUM(total_lent), 0) AS lent, COALESCE(SUM(interest_received), 0) AS interest FROM loan_summary')
+      .get();
     const borrowerCounts = db
       .prepare(
-        `SELECT (SELECT COUNT(*) FROM borrowers WHERE is_archived = 0 AND owner_id = @ownerId) AS total,
-                (SELECT COUNT(DISTINCT l.borrower_id) FROM loans l JOIN borrowers b ON b.id = l.borrower_id
-                  WHERE l.status = 'active' AND b.owner_id = @ownerId) AS withActiveLoan`
+        `SELECT (SELECT COUNT(*) FROM borrowers WHERE is_archived = 0) AS total,
+                (SELECT COUNT(DISTINCT borrower_id) FROM loans WHERE status = 'active') AS withActiveLoan`
       )
-      .get({ ownerId: req.user.id });
+      .get();
 
-    const thisMonth = sumByType(monthStart, today, req.user.id);
-    const lastMonth = sumByType(prevMonthStart, prevMonthEnd, req.user.id);
+    const thisMonth = sumByType(monthStart, today);
+    const lastMonth = sumByType(prevMonthStart, prevMonthEnd);
 
     // Reminders that need attention now
     const reminderRows = db
-      .prepare(`${REMINDER_SELECT} WHERE r.owner_id = ? AND r.is_done = 0 AND r.remind_on <= ? ORDER BY r.remind_on ASC, r.id ASC`)
-      .all(req.user.id, today);
+      .prepare(`${REMINDER_SELECT} WHERE r.is_done = 0 AND r.remind_on <= ? ORDER BY r.remind_on ASC, r.id ASC`)
+      .all(today);
     const remindersDue = reminderRows.map(reminderOut);
     const upcomingReminders = db
-      .prepare('SELECT COUNT(*) AS c FROM reminders WHERE owner_id = ? AND is_done = 0 AND remind_on > ? AND remind_on <= ?')
-      .get(req.user.id, today, upcomingEnd).c;
+      .prepare('SELECT COUNT(*) AS c FROM reminders WHERE is_done = 0 AND remind_on > ? AND remind_on <= ?')
+      .get(today, upcomingEnd).c;
 
     // One combined list for the notification bell / home-page banner
     const notifications = [
@@ -428,10 +411,10 @@ module.exports = function (ctx) {
            FROM transactions t
            JOIN loans l ON l.id = t.loan_id
            JOIN borrowers b ON b.id = l.borrower_id
-          WHERE t.is_voided = 0 AND b.owner_id = ?
+          WHERE t.is_voided = 0
           ORDER BY t.txn_date DESC, t.id DESC LIMIT 10`
       )
-      .all(req.user.id)
+      .all()
       .map((t) => ({
         id: t.id,
         loanId: t.loan_id,
@@ -507,17 +490,16 @@ module.exports = function (ctx) {
                 (SELECT MIN(l.next_due_date) FROM loans l
                   WHERE l.borrower_id = b.id AND l.status = 'active') AS next_due_date
            FROM borrowers b
-          WHERE b.owner_id = @ownerId
-            AND (b.full_name LIKE @like ESCAPE '\\'
+          WHERE b.full_name LIKE @like ESCAPE '\\'
              OR b.city LIKE @like ESCAPE '\\'
              OR b.id_proof_number LIKE @like ESCAPE '\\'
              OR b.guarantor_name LIKE @like ESCAPE '\\'
              OR ${stripped('b.phone')} LIKE @digits ESCAPE '\\'
-             OR ${stripped('b.alt_phone')} LIKE @digits ESCAPE '\\')
+             OR ${stripped('b.alt_phone')} LIKE @digits ESCAPE '\\'
           ORDER BY b.is_archived ASC, b.full_name COLLATE NOCASE ASC
           LIMIT 10`
       )
-      .all({ like, digits, ownerId: req.user.id })
+      .all({ like, digits })
       .map((b) => ({
         id: b.id,
         fullName: b.full_name,
@@ -530,9 +512,9 @@ module.exports = function (ctx) {
       }));
 
     const reminders = db
-      .prepare(`${REMINDER_SELECT} WHERE r.owner_id = @ownerId AND (r.title LIKE @like ESCAPE '\\' OR r.details LIKE @like ESCAPE '\\')
+      .prepare(`${REMINDER_SELECT} WHERE r.title LIKE @like ESCAPE '\\' OR r.details LIKE @like ESCAPE '\\'
                 ORDER BY r.is_done ASC, r.remind_on ASC LIMIT 5`)
-      .all({ like, ownerId: req.user.id })
+      .all({ like })
       .map(reminderOut);
 
     res.json({ borrowers, reminders });
