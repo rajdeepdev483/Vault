@@ -137,6 +137,15 @@ const VaultApp = (() => {
     setActiveNav(tab);
     const content = document.getElementById('tab-content');
     const item = NAV_ITEMS.find((n) => n.id === tab);
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    // Brief fade-out of whatever's on screen before swapping content —
+    // makes tab switches feel like one continuous motion instead of a snap.
+    if (!reduce && content.childElementCount) {
+      content.classList.remove('tab-entering');
+      content.classList.add('tab-leaving');
+      await UI.wait(90);
+    }
 
     if (!item.ready) {
       content.innerHTML = `
@@ -146,10 +155,7 @@ const VaultApp = (() => {
           <p>This screen is being built next. Everything here will be editable right from the app.</p>
         </div>
       `;
-      return;
-    }
-
-    if (tab === 'home') {
+    } else if (tab === 'home') {
       const result = await Dashboard.render(content);
       if (result) updateNotifBadge(result.notificationCount);
     } else if (tab === 'borrowers') {
@@ -160,6 +166,12 @@ const VaultApp = (() => {
       await Reminders.render(content);
     } else if (tab === 'settings') {
       await Settings.render(content);
+    }
+
+    content.classList.remove('tab-leaving');
+    if (!reduce) {
+      void content.offsetWidth; // restart the entrance animation each time
+      content.classList.add('tab-entering');
     }
   }
 

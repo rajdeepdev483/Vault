@@ -168,10 +168,10 @@ const Settings = (() => {
       el.innerHTML = sessions.map((s) => `
         <div class="d-item" style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
           <div>
-            <div class="d-value">${UI.escapeHtml(describeDevice(s.userAgent))}${s.isCurrent ? ' <span style="color:var(--accent);font-size:12px;">(this device)</span>' : ''}</div>
+            <div class="d-value">${UI.escapeHtml(describeDevice(s.userAgent))}${s.isCurrent ? ' <span style="color:var(--brand);font-size:12px;">(this device)</span>' : ''}</div>
             <div class="d-label">${s.ipAddress ? UI.escapeHtml(s.ipAddress) + ' · ' : ''}Signed in ${UI.formatDate((s.createdAt || '').slice(0, 10))}</div>
           </div>
-          ${s.isCurrent ? '' : `<button type="button" class="btn-text session-revoke" data-id="${UI.escapeHtml(s.id)}" style="color:var(--danger,#e5484d);flex-shrink:0;">Sign out</button>`}
+          ${s.isCurrent ? '' : `<button type="button" class="btn-text session-revoke" data-id="${UI.escapeHtml(s.id)}" style="color:var(--warning);flex-shrink:0;">Sign out</button>`}
         </div>
       `).join('') || `<div class="d-item"><div class="d-value empty">No active sessions</div></div>`;
 
@@ -201,6 +201,7 @@ const Settings = (() => {
       await Api.del('/api/auth/sessions');
       UI.toast('Signed out on every other device');
       loadSessions();
+      UI.pulse(btn.closest('.profile-card'));
     } catch (err) {
       UI.toast(err.message);
     } finally {
@@ -232,6 +233,7 @@ const Settings = (() => {
         const { user } = await Api.patch('/api/auth/me', { fullName });
         me = user;
         UI.toast('Account updated');
+        UI.pulse(form.closest('.profile-card'));
       } catch (err) {
         UI.toast(err.message);
       } finally {
@@ -276,6 +278,7 @@ const Settings = (() => {
             close();
             draw();
             UI.toast('Account updated');
+            UI.pulse(document.getElementById('account-form').closest('.profile-card'));
           } catch (err) {
             UI.toast(err.message);
             btn.disabled = false;
@@ -306,6 +309,7 @@ const Settings = (() => {
         UI.setCurrencySymbol(settings.currencySymbol);
         window.VaultApp.onSettingsLoaded(settings);
         UI.toast('Settings saved');
+        UI.pulse(form.closest('.profile-card'));
       } catch (err) {
         UI.toast(err.message);
       } finally {
@@ -393,6 +397,8 @@ const Settings = (() => {
             });
             close();
             UI.toast('Password changed');
+            const pwBtn = document.getElementById('change-pw-btn');
+            if (pwBtn) UI.pulse(pwBtn.closest('.profile-card'));
           } catch (err) {
             UI.toast(err.message);
             btn.disabled = false;

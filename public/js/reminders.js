@@ -67,7 +67,7 @@ const Reminders = (() => {
     `;
   }
 
-  async function loadList() {
+  async function loadList(pulseId) {
     const listEl = document.getElementById('r-list');
     if (!listEl) return;
     listEl.innerHTML = Array.from({ length: 3 }).map(() => '<div class="skel skel-row"></div>').join('');
@@ -94,6 +94,10 @@ const Reminders = (() => {
         if (item) openMenu(item);
       });
     });
+    if (pulseId) {
+      const row = listEl.querySelector(`.borrower-row[data-id="${pulseId}"]`);
+      if (row) UI.pulse(row);
+    }
   }
 
   function openMenu(r) {
@@ -120,7 +124,7 @@ const Reminders = (() => {
             try {
               await Api.patch(`/api/reminders/${r.id}`, { isDone: act === 'done' });
               UI.toast(act === 'done' ? 'Marked as done' : 'Marked as pending');
-              await loadList();
+              await loadList(r.id);
             } catch (err) { UI.toast(err.message); }
           });
         });
@@ -232,11 +236,12 @@ const Reminders = (() => {
           btn.disabled = true;
           btn.textContent = 'Saving…';
           try {
-            if (existing) await Api.patch(`/api/reminders/${existing.id}`, payload);
-            else await Api.post('/api/reminders', payload);
+            let saved;
+            if (existing) saved = await Api.patch(`/api/reminders/${existing.id}`, payload);
+            else saved = await Api.post('/api/reminders', payload);
             close();
             UI.toast(existing ? 'Reminder updated' : 'Reminder added');
-            await loadList();
+            await loadList(saved.reminder.id);
           } catch (err) {
             UI.toast(err.message);
             btn.disabled = false;

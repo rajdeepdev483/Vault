@@ -151,11 +151,11 @@ const Dashboard = (() => {
         </div>
       </div>
 
-      <div class="quick-grid">
-        <button class="quick-tile" data-go="borrowers"><span class="q-ico">${UI.icon('users', { size: 22 })}</span><span class="q-title">Borrowers</span><span class="q-sub">Add, find or open a borrower</span></button>
-        <button class="quick-tile" data-go="loans"><span class="q-ico">${UI.icon('list', { size: 22 })}</span><span class="q-title">All loans</span><span class="q-sub">Every loan and its balance</span></button>
-        <button class="quick-tile" data-go="reminders"><span class="q-ico">${UI.icon('clock', { size: 22 })}</span><span class="q-title">Collections</span><span class="q-sub">Who to collect from</span></button>
-        <button class="quick-tile" data-go="settings"><span class="q-ico">${UI.icon('settings', { size: 22 })}</span><span class="q-title">Settings</span><span class="q-sub">Backup, password, theme</span></button>
+      <div class="quick-row">
+        <button class="quick-circle fade-in" data-go="borrowers"><span class="qc-ico">${UI.icon('users', { size: 22 })}</span><span class="qc-label">Borrowers</span></button>
+        <button class="quick-circle fade-in" data-go="loans"><span class="qc-ico">${UI.icon('list', { size: 22 })}</span><span class="qc-label">All loans</span></button>
+        <button class="quick-circle fade-in" data-go="reminders"><span class="qc-ico">${UI.icon('clock', { size: 22 })}</span><span class="qc-label">Collections</span></button>
+        <button class="quick-circle fade-in" data-go="settings"><span class="qc-ico">${UI.icon('settings', { size: 22 })}</span><span class="qc-label">Settings</span></button>
       </div>
 
       ${section(
@@ -209,7 +209,7 @@ const Dashboard = (() => {
     document.getElementById('stat-interest') && UI.countUp(document.getElementById('stat-interest'), summary.expectedMonthlyInterest, { decimals: 0 });
     document.getElementById('stat-pending') && UI.countUp(document.getElementById('stat-pending'), Math.abs(summary.interestPending), { decimals: 0 });
 
-    container.querySelectorAll('.loan-card, .notif-chip').forEach((el, i) => {
+    container.querySelectorAll('.loan-card, .notif-chip, .quick-circle').forEach((el, i) => {
       el.style.animationDelay = `${Math.min(i * 30, 300)}ms`;
     });
 

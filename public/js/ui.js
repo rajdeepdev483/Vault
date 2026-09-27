@@ -139,6 +139,68 @@ const UI = (() => {
     toastTimer = setTimeout(() => el.classList.remove('show'), 2400);
   }
 
+  function wait(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // -------------------------------------------------------------------
+  // TAP FEEDBACK
+  // Two things, both global and set up once:
+  //  1. The classic iOS Safari gotcha — it never fires the CSS :active
+  //     state on a tap unless *something* on the page listens for
+  //     touchstart. This one passive listener is that fix, and makes
+  //     every :active press-scale in styles.css actually work on iPhone.
+  //  2. A JS-driven `.is-pressed` class as a second layer on top of
+  //     that, which also cancels itself the moment a "tap" turns into
+  //     a scroll/drag, so cards never look stuck mid-press.
+  // -------------------------------------------------------------------
+  const TAPPABLE = '.btn, .icon-btn, .tab-item, .nav-item, .fab, .loan-card, ' +
+    '.borrower-row, .cycle-card, .quick-tile, .quick-circle, .action-sheet-item, ' +
+    '.record-payment-btn, .segmented button, .type-tabs button';
+
+  function enableTapFeedback() {
+    document.addEventListener('touchstart', () => {}, { passive: true });
+
+    let pressedEl = null;
+    let startX = 0;
+    let startY = 0;
+
+    function release() {
+      if (!pressedEl) return;
+      pressedEl.classList.remove('is-pressed');
+      pressedEl = null;
+    }
+
+    document.addEventListener('pointerdown', (e) => {
+      const el = e.target.closest(TAPPABLE);
+      if (!el || el.disabled) return;
+      pressedEl = el;
+      startX = e.clientX;
+      startY = e.clientY;
+      el.classList.add('is-pressed');
+    }, { passive: true });
+
+    document.addEventListener('pointermove', (e) => {
+      if (!pressedEl) return;
+      if (Math.abs(e.clientX - startX) > 8 || Math.abs(e.clientY - startY) > 8) release();
+    }, { passive: true });
+
+    document.addEventListener('pointerup', release, { passive: true });
+    document.addEventListener('pointercancel', release, { passive: true });
+    window.addEventListener('scroll', release, { passive: true, capture: true });
+  }
+
+  // Brief lime "saved" ring — same idea as the editable-field flash, but
+  // usable on any element (e.g. flash the balance card after a payment).
+  function pulse(el) {
+    if (!el) return;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduce) return;
+    el.classList.remove('vault-pulse');
+    void el.offsetWidth; // restart the animation if it's already mid-flight
+    el.classList.add('vault-pulse');
+  }
+
   // -------------------------------------------------------------------
   // CLICK-TO-EDIT FIELD
   // Turns `el` into a self-contained inline editor: shows the current
@@ -339,7 +401,7 @@ const UI = (() => {
       <span class="pw-label"></span>
     `;
     input.parentNode.parentNode.insertBefore(meter, input.parentNode.nextSibling);
-    const colors = ['#e5484d', '#f5a623', '#f5a623', '#3dd598', '#3dd598'];
+    const colors = ['var(--warning)', 'var(--amber)', 'var(--amber)', 'var(--positive)', 'var(--positive)'];
     input.addEventListener('input', () => {
       const { score, label } = passwordStrength(input.value);
       meter.style.display = input.value ? 'block' : 'none';
@@ -349,6 +411,8 @@ const UI = (() => {
       meter.querySelector('.pw-label').textContent = label;
     });
   }
+
+  document.addEventListener('DOMContentLoaded', enableTapFeedback);
 
   return {
     setCurrencySymbol,
@@ -360,6 +424,8 @@ const UI = (() => {
     escapeHtml,
     countUp,
     toast,
+    wait,
+    pulse,
     applyTheme,
     icon,
     editableField,

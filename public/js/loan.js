@@ -267,6 +267,7 @@ const Loan = (() => {
             if (result.dueDateMovedTo) msg += ` · next due ${UI.formatDateShort(result.dueDateMovedTo)}`;
             UI.toast(msg);
             await reload(loan.id);
+            UI.pulse(container.querySelector('.loan-summary-card'));
           } catch (err) {
             UI.toast(err.message);
             btn.disabled = false;
@@ -348,6 +349,7 @@ const Loan = (() => {
             closeFn();
             UI.toast('Loan settings updated');
             await reload(loan.id);
+            UI.pulse(container.querySelector('.loan-summary-card'));
           } catch (err) {
             UI.toast(err.message);
             btn.disabled = false;
@@ -377,6 +379,7 @@ const Loan = (() => {
       await Api.post(`/api/loans/${loan.id}/status`, payload);
       UI.toast(status === 'closed' ? 'Cycle closed' : status === 'active' ? 'Cycle reopened' : 'Marked defaulted');
       await reload(loan.id);
+      UI.pulse(container.querySelector('.loan-summary-card'));
     } catch (err) {
       if (err.status === 409 && err.extra && err.extra.needsConfirmation) {
         const forceOk = await Modal.confirm({
@@ -497,6 +500,7 @@ const Loan = (() => {
             closeFn();
             UI.toast('Entry updated');
             await reload(entry.loanId);
+            UI.pulse(container.querySelector('.loan-summary-card'));
           } catch (err) {
             UI.toast(err.message);
             btn.disabled = false;
@@ -519,7 +523,7 @@ const Loan = (() => {
       `,
       footHtml: `
         <button type="button" class="btn btn-ghost" data-cancel>Cancel</button>
-        <button type="button" class="btn btn-primary" id="void-confirm" style="background:linear-gradient(135deg,#FF6B6B,#FF9B9B);">Void entry</button>
+        <button type="button" class="btn btn-primary" id="void-confirm" style="background:var(--warning);color:#fff;box-shadow:none;">Void entry</button>
       `,
       onMount: (body, foot, closeFn) => {
         foot.querySelector('[data-cancel]').addEventListener('click', closeFn);
@@ -532,6 +536,7 @@ const Loan = (() => {
             closeFn();
             UI.toast('Entry voided');
             await reload(entry.loanId);
+            UI.pulse(container.querySelector('.loan-summary-card'));
           } catch (err) {
             UI.toast(err.message);
             btn.disabled = false;
@@ -546,6 +551,7 @@ const Loan = (() => {
       await Api.post(`/api/transactions/${entry.id}/restore`);
       UI.toast('Entry restored');
       await reload(entry.loanId);
+      UI.pulse(container.querySelector('.loan-summary-card'));
     } catch (err) {
       UI.toast(err.message);
     }

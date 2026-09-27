@@ -262,7 +262,7 @@ const Borrowers = (() => {
             close();
             UI.toast('Borrower added');
             await loadList(true);
-            openProfile(borrower.id);
+            openProfile(borrower.id, { pulse: true });
           } catch (err) {
             UI.toast(err.message);
             btn.disabled = false;
@@ -309,7 +309,7 @@ const Borrowers = (() => {
   // -------------------------------------------------------------------
   // PROFILE SCREEN
   // -------------------------------------------------------------------
-  async function openProfile(id) {
+  async function openProfile(id, { pulse = false } = {}) {
     container.innerHTML = `
       <div class="subview-head">
         <button class="icon-btn" id="b-back">${UI.icon('chevron-left', { size: 18 })}</button>
@@ -338,6 +338,7 @@ const Borrowers = (() => {
     }
 
     renderProfile(borrower);
+    if (pulse) UI.pulse(container.querySelector('.profile-card'));
   }
 
   function renderProfile(borrower) {
@@ -465,7 +466,7 @@ const Borrowers = (() => {
     });
 
     document.getElementById('b-edit').addEventListener('click', () => {
-      openEditForm(borrower, () => openProfile(borrower.id));
+      openEditForm(borrower, () => openProfile(borrower.id, { pulse: true }));
     });
     const archiveBtn = document.getElementById('b-archive');
     if (archiveBtn) {
@@ -479,7 +480,7 @@ const Borrowers = (() => {
         try {
           await Api.post(`/api/borrowers/${borrower.id}/archive`);
           UI.toast('Borrower archived');
-          openProfile(borrower.id);
+          openProfile(borrower.id, { pulse: true });
         } catch (err) { UI.toast(err.message); }
       });
     }
@@ -489,7 +490,7 @@ const Borrowers = (() => {
         try {
           await Api.post(`/api/borrowers/${borrower.id}/restore`);
           UI.toast('Borrower restored');
-          openProfile(borrower.id);
+          openProfile(borrower.id, { pulse: true });
         } catch (err) { UI.toast(err.message); }
       });
     }
@@ -629,7 +630,7 @@ const Borrowers = (() => {
             await Api.post(`/api/borrowers/${borrower.id}/loans`, payload);
             close();
             UI.toast('Loan cycle started');
-            openProfile(borrower.id);
+            openProfile(borrower.id, { pulse: true });
           } catch (err) {
             UI.toast(err.message);
             btn.disabled = false;
